@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Linkgate</title>
+<style>
+:root {
+  /* tokens 与 UX.md §6 保持一致 */
+  --bg: #FFFFFF; --panel: #F7F8F8; --line: #E5E7EB; --text: #1A1D1F; --muted: #6B7280; --faint: #9BA1A8;
+  --accent: #0F9D8F; --accent-weak: rgba(15,157,143,.12);
+  --ok: #2E9E5B; --warn: #C98A16; --err: #D14343;
+  --radius: 10px; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111315; --panel: #191C1F; --line: #2A2F34; --text: #E6E8EA; --muted: #9BA1A8; --faint: #6B7280;
+    --accent: #0F9D8F; --accent-weak: rgba(15,157,143,.18);
+    --ok: #2E9E5B; --warn: #C98A16; --err: #D14343;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body {
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  padding: 12px 16px 24px;
+}
+button, textarea, input { font: inherit; color: inherit; }
+button {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 7px;
+  padding: 3px 10px; cursor: pointer; white-space: nowrap;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .55; cursor: default; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mono { font-family: var(--mono); font-size: 12px; }
+.muted { color: var(--muted); }
+
+header {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 8px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+}
+header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+header .sep { color: var(--faint); }
+header .path { flex: 1; min-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conn { display: inline-flex; align-items: center; gap: 6px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
+
+.notice {
+  margin-top: 10px; padding: 8px 12px; border-radius: var(--radius);
+  border: 1px solid var(--line); background: var(--panel);
+}
+.notice.err { border-color: var(--err); color: var(--err); }
+.notice[hidden] { display: none; }
+
+section.group { margin-top: 14px; }
+.group-head { display: flex; align-items: baseline; gap: 10px; margin: 0 2px 6px; }
+.group-head h2 { font-size: 13px; margin: 0; font-weight: 600; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 8px; }
+.card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 9px 11px; display: flex; flex-direction: column; gap: 6px; min-width: 0;
+}
+.card.active { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.card .row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.card .name { font-weight: 600; }
+.card .prio { color: var(--muted); font-size: 12px; }
+.card .url { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card .spacer { flex: 1; }
+.pill { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.pill.healthy { color: var(--ok); border-color: currentColor; }
+.pill.unhealthy { color: var(--err); border-color: currentColor; }
+.pill.unknown { color: var(--warn); border-color: currentColor; }
+.pill.disabled { color: var(--faint); }
+.tag-active { font-size: 11px; color: var(--accent); background: var(--accent-weak); padding: 1px 6px; border-radius: 5px; }
+.stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 22px; font-size: 12px; }
+.stats div { display: flex; justify-content: space-between; gap: 6px; }
+.stats dt { color: var(--muted); }
+.stats dd { margin: 0; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.err-line { font-size: 12px; color: var(--err); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-height: 17px; }
+.err-line.none { color: var(--faint); }
+.actions { display: flex; gap: 6px; align-items: center; }
+.actions .result { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.actions .result.bad { color: var(--err); }
+.actions .result.good { color: var(--ok); }
+
+.box { margin-top: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+.box-head { display: flex; align-items: center; gap: 10px; padding: 7px 11px; border-bottom: 1px solid var(--line); }
+.box-head h2 { font-size: 13px; margin: 0; font-weight: 600; }
+.box-head .spacer { flex: 1; }
+.box-head label { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); cursor: pointer; }
+#events { max-height: 300px; overflow: auto; }
+.ev { display: grid; grid-template-columns: 4px 58px 104px 1fr; gap: 8px; padding: 3px 11px 3px 0; align-items: baseline; border-bottom: 1px solid var(--line); }
+.ev:last-child { border-bottom: 0; }
+.ev .bar { align-self: stretch; background: var(--faint); }
+.ev .t, .ev .k { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ev .k { color: var(--muted); }
+.ev.warn .bar { background: var(--warn); } .ev.error .bar { background: var(--err); }
+.ev.failover .bar { background: var(--accent); }
+.ev.error .msg { color: var(--err); }
+.ev .t { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+.ev .k { color: var(--muted); font-size: 12px; }
+.ev .msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.empty { padding: 10px 11px; color: var(--muted); }
+
+details.box > summary { padding: 7px 11px; cursor: pointer; font-weight: 600; list-style: revert; }
+details.box[open] > summary { border-bottom: 1px solid var(--line); }
+.cfg { padding: 10px 11px; display: flex; flex-direction: column; gap: 8px; }
+.cfg textarea {
+  width: 100%; min-height: 340px; resize: vertical; font-family: var(--mono); font-size: 12px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 8px; tab-size: 2;
+}
+.cfg .bar2 { display: flex; gap: 10px; align-items: center; }
+.cfg pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12px; color: var(--err); }
+.cfg .okmsg { color: var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Linkgate</h1>
+  <span id="ver" class="mono muted">—</span>
+  <span class="sep">·</span>
+  <span>运行 <span id="uptime" class="mono">—</span></span>
+  <span class="sep">·</span>
+  <span id="cfgpath" class="path mono muted" title="">—</span>
+  <span class="conn" role="status" aria-live="polite"><span id="conndot" class="dot"></span><span id="conntext">连接中</span></span>
+</header>
+
+<div id="notice" class="notice" hidden></div>
+<main id="groups"></main>
+
+<section class="box" aria-labelledby="ev-title">
+  <div class="box-head">
+    <h2 id="ev-title">事件</h2>
+    <span id="evcount" class="muted mono"></span>
+    <span class="spacer"></span>
+    <label><input type="checkbox" id="onlyFailover"> 只看换线路</label>
+  </div>
+  <div id="events" tabindex="0" aria-label="事件流"></div>
+</section>
+
+<details class="box" id="cfgbox">
+  <summary>配置文件</summary>
+  <div class="cfg">
+    <div class="muted mono" id="cfgfile"></div>
+    <textarea id="cfgtext" spellcheck="false" aria-label="配置 YAML"></textarea>
+    <div class="bar2">
+      <button class="primary" id="cfgsave" type="button">校验并保存</button>
+      <button id="cfgreload" type="button">从磁盘重新载入</button>
+      <span id="cfgstate" class="muted"></span>
+    </div>
+    <pre id="cfgerr" hidden></pre>
+  </div>
+</details>
+
+<script>
+(function () {
+  "use strict";
+  var API = "/__linkgate/v1";
+  var MAX_EVENTS = 300;
+  var token = (new URLSearchParams(location.hash.replace(/^#/, ""))).get("token") || "";
+
+  var $ = function (id) { return document.getElementById(id); };
+  var events = [];
+  var lastSeq = 0;
+  var lastStatus = null;
+  var cards = {};        // key -> {el, refs}
+  var groupEls = {};     // group name -> section
+  var busy = {};         // key -> true while an action is in flight
+  var cfgLoaded = false, cfgDirty = false;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function api(path, opts) {
+    opts = opts || {};
+    var headers = opts.headers || {};
+    if (token) headers["X-Linkgate-Token"] = token;
+    return fetch(API + path, { method: opts.method || "GET", headers: headers, body: opts.body, cache: "no-store" })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          var data = null;
+          try { data = t ? JSON.parse(t) : null; } catch (e) { data = { error: t }; }
+          if (!r.ok) {
+            var err = new Error((data && data.error) || ("HTTP " + r.status));
+            err.status = r.status;
+            throw err;
+          }
+          return data;
+        });
+      });
+  }
+
+  function fmtDur(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    var d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+    if (d) return d + "天" + h + "时";
+    if (h) return h + "时" + m + "分";
+    if (m) return m + "分" + s + "秒";
+    return s + "秒";
+  }
+  function fmtMs(v, at) {
+    if (!at || String(at).indexOf("0001-") === 0) return "—";
+    return (v || 0) + "ms";
+  }
+  function hasTime(t) { return t && String(t).indexOf("0001-") !== 0; }
+  function fmtTime(t) {
+    var d = new Date(t);
+    if (isNaN(d)) return "";
+    var p = function (n) { return String(n).padStart(2, "0"); };
+    return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+  var STATUS_TEXT = { healthy: "正常", unhealthy: "故障", unknown: "未知", disabled: "已停用" };
+  var KIND_TEXT = { start: "启动", request: "请求", failover: "换线路", health: "健康", probe: "探针", config: "配置" };
+
+  function setConn(state, text) {
+    $("conndot").className = "dot " + state;
+    $("conntext").textContent = text;
+  }
+  function notice(text, isErr) {
+    var n = $("notice");
+    if (!text) { n.hidden = true; return; }
+    n.hidden = false;
+    n.textContent = text;
+    n.className = "notice" + (isErr ? " err" : "");
+  }
+
+  // ---------- 线路卡片 ----------
+  function buildCard(group, name) {
+    var c = el("article", "card");
+    var r1 = el("div", "row");
+    var nm = el("span", "name", name);
+    var prio = el("span", "prio");
+    var act = el("span", "tag-active", "当前");
+    var sp = el("span", "spacer");
+    var pill = el("span", "pill");
+    r1.append(nm, prio, act, sp, pill);
+
+    var url = el("div", "url mono");
+
+    var stats = el("dl", "stats");
+    var refs = {};
+    [["probe", "探针"], ["req", "请求延迟"], ["ok", "成功"], ["fail", "失败"], ["out", "换出"], ["backup", "备用选中"]]
+      .forEach(function (p) {
+        var w = el("div"); var dt = el("dt", null, p[1]); var dd = el("dd", null, "—");
+        w.append(dt, dd); stats.append(w); refs[p[0]] = dd;
+      });
+
+    var err = el("div", "err-line");
+    var actions = el("div", "actions");
+    var bTest = el("button", null, "测试"); bTest.type = "button";
+    var bToggle = el("button", null, "停用"); bToggle.type = "button";
+    var result = el("span", "result");
+    actions.append(bTest, bToggle, result);
+
+    c.append(r1, url, stats, err, actions);
+
+    var key = group + "\u0000" + name;
+    bTest.addEventListener("click", function () { probe(group, name, key); });
+    bToggle.addEventListener("click", function () { toggle(group, name, key); });
+
+    Object.assign(refs, { card: c, prio: prio, act: act, pill: pill, url: url, err: err, bTest: bTest, bToggle: bToggle, result: result, name: nm });
+    return refs;
+  }
+
+  function updateCard(refs, u, isActive) {
+    refs.card.classList.toggle("active", !!isActive);
+    refs.act.hidden = !isActive;
+    refs.prio.textContent = "P" + u.priority;
+    refs.pill.className = "pill " + u.status;
+    refs.pill.textContent = STATUS_TEXT[u.status] || u.status;
+    refs.url.textContent = u.url;
+    refs.url.title = u.url;
+    if (u.comment) refs.name.title = u.comment;
+    refs.probe.textContent = fmtMs(u.last_probe_latency_ms, u.last_probe_at);
+    refs.req.textContent = fmtMs(u.last_request_latency_ms, u.last_request_at);
+    refs.ok.textContent = u.requests_ok || 0;
+    refs.fail.textContent = u.requests_failed || 0;
+    refs.out.textContent = u.failovers_out || 0;
+    refs.backup.textContent = u.selected_as_backup || 0;
+
+    var errText = "", errAt = null;
+    if (u.last_request_error && u.last_probe_error) {
+      errText = new Date(u.last_request_at) > new Date(u.last_probe_at) ? "请求：" + u.last_request_error : "探针：" + u.last_probe_error;
+    } else if (u.last_request_error) errText = "请求：" + u.last_request_error;
+    else if (u.last_probe_error) errText = "探针：" + u.last_probe_error;
+    refs.err.textContent = errText || "无错误";
+    refs.err.title = errText;
+    refs.err.className = "err-line" + (errText ? "" : " none");
+
+    refs.bToggle.textContent = u.enabled ? "停用" : "启用";
+    refs.bToggle.setAttribute("aria-label", (u.enabled ? "停用 " : "启用 ") + u.name);
+    refs.bTest.setAttribute("aria-label", "测试 " + u.name);
+    refs.enabled = u.enabled;
+  }
+
+  function renderGroups(st) {
+    var root = $("groups");
+    var seenG = {}, seenC = {};
+    var groups = st.groups || [];
+    if (!groups.length) {
+      root.textContent = "";
+      root.append(el("div", "notice", "配置中没有线路组"));
+      groupEls = {}; cards = {};
+      return;
+    }
+    if (root.firstElementChild && root.firstElementChild.classList.contains("notice")) root.textContent = "";
+
+    groups.forEach(function (g, gi) {
+      seenG[g.name] = true;
+      var sec = groupEls[g.name];
+      if (!sec) {
+        sec = el("section", "group");
+        var head = el("div", "group-head");
+        var h = el("h2", null, g.name);
+        var meta = el("span", "muted mono");
+        head.append(h, meta);
+        var grid = el("div", "cards");
+        sec.append(head, grid);
+        sec._meta = meta; sec._grid = grid;
+        groupEls[g.name] = sec;
+      }
+      if (root.children[gi] !== sec) root.insertBefore(sec, root.children[gi] || null);
+      var ups = g.upstreams || [];
+      var healthy = ups.filter(function (u) { return u.status === "healthy"; }).length;
+      sec._meta.textContent = "监听 " + g.listen + " · 当前 " + (g.active || "无") + " · " + healthy + "/" + ups.length + " 正常";
+
+      ups.forEach(function (u, ui) {
+        var key = g.name + "\u0000" + u.name;
+        seenC[key] = true;
+        var refs = cards[key];
+        if (!refs) { refs = buildCard(g.name, u.name); cards[key] = refs; }
+        if (sec._grid.children[ui] !== refs.card) sec._grid.insertBefore(refs.card, sec._grid.children[ui] || null);
+        updateCard(refs, u, g.active === u.name);
+      });
+    });
+    Object.keys(cards).forEach(function (k) { if (!seenC[k]) { cards[k].card.remove(); delete cards[k]; } });
+    Object.keys(groupEls).forEach(function (k) { if (!seenG[k]) { groupEls[k].remove(); delete groupEls[k]; } });
+  }
+
+  function probe(group, name, key) {
+    var refs = cards[key];
+    if (!refs || busy[key]) return;
+    busy[key] = true;
+    refs.bTest.disabled = true;
+    refs.result.className = "result";
+    refs.result.textContent = "测试中";
+    api("/probe?group=" + encodeURIComponent(group) + "&upstream=" + encodeURIComponent(name), { method: "POST" })
+      .then(function (d) {
+        var r = cards[key]; if (!r) return;
+        if (d.ok) { r.result.className = "result good"; r.result.textContent = "通 " + d.latency_ms + "ms"; r.result.title = ""; }
+        else { r.result.className = "result bad"; r.result.textContent = "不通 " + (d.error || ""); r.result.title = d.error || ""; }
+      })
+      .catch(function (e) { var r = cards[key]; if (r) { r.result.className = "result bad"; r.result.textContent = e.message; r.result.title = e.message; } })
+      .finally(function () { busy[key] = false; var r = cards[key]; if (r) r.bTest.disabled = false; poll(); });
+  }
+
+  function toggle(group, name, key) {
+    var refs = cards[key];
+    if (!refs || busy[key]) return;
+    busy[key] = true;
+    refs.bToggle.disabled = true;
+    var next = !refs.enabled;
+    api("/toggle?group=" + encodeURIComponent(group) + "&upstream=" + encodeURIComponent(name) + "&enabled=" + next, { method: "POST" })
+      .then(function () { var r = cards[key]; if (r) { r.result.className = "result"; r.result.textContent = next ? "已运行时启用" : "已运行时停用"; r.result.title = "重启后恢复配置文件设置"; } })
+      .catch(function (e) { var r = cards[key]; if (r) { r.result.className = "result bad"; r.result.textContent = e.message; } })
+      .finally(function () { busy[key] = false; var r = cards[key]; if (r) r.bToggle.disabled = false; poll(); });
+  }
+
+  // ---------- 事件 ----------
+  function renderEvents() {
+    var box = $("events");
+    var only = $("onlyFailover").checked;
+    var list = only ? events.filter(function (e) { return e.kind === "failover"; }) : events;
+    var stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+    box.textContent = "";
+    if (!list.length) {
+      box.append(el("div", "empty", only ? "暂无换线路事件" : "暂无事件"));
+    } else {
+      var frag = document.createDocumentFragment();
+      list.forEach(function (e) {
+        var lvl = e.level === "error" ? "error" : e.level === "warn" ? "warn" : "info";
+        var row = el("div", "ev " + lvl + (e.kind === "failover" ? " failover" : ""));
+        var bar = el("span", "bar");
+        var t = el("span", "t", fmtTime(e.time));
+        t.title = e.time;
+        var k = el("span", "k", (KIND_TEXT[e.kind] || e.kind) + (e.group ? " · " + e.group : ""));
+        var parts = [];
+        if (e.from || e.to) parts.push((e.from || "?") + " → " + (e.to || "?"));
+        else if (e.upstream) parts.push("[" + e.upstream + "]");
+        parts.push(e.message);
+        if (e.status) parts.push("HTTP " + e.status);
+        if (e.duration_ms) parts.push(e.duration_ms + "ms");
+        var msg = el("span", "msg", parts.join(" "));
+        msg.title = parts.join(" ");
+        row.append(bar, t, k, msg);
+        frag.append(row);
+      });
+      box.append(frag);
+    }
+    $("evcount").textContent = list.length ? String(list.length) : "";
+    if (stick) box.scrollTop = box.scrollHeight;
+  }
+
+  function pullEvents(statusSeq) {
+    if (statusSeq < lastSeq) { events = []; lastSeq = 0; }  // 内核重启，序号归零
+    if (lastSeq && statusSeq === lastSeq) return Promise.resolve();
+    var q = lastSeq ? "/events?after=" + lastSeq + "&limit=" + MAX_EVENTS : "/events?limit=" + MAX_EVENTS;
+    return api(q).then(function (d) {
+      var fresh = (d.events || []).filter(function (e) { return e.seq > lastSeq; });
+      if (fresh.length) {
+        events = events.concat(fresh);
+        if (events.length > MAX_EVENTS) events = events.slice(events.length - MAX_EVENTS);
+      }
+      lastSeq = Math.max(lastSeq, d.last_seq || 0, fresh.length ? fresh[fresh.length - 1].seq : 0);
+      if (fresh.length || !$("events").firstChild) renderEvents();
+    });
+  }
+
+  // ---------- 配置 ----------
+  function loadConfig() {
+    $("cfgstate").textContent = "载入中";
+    $("cfgerr").hidden = true;
+    return api("/config").then(function (d) {
+      $("cfgfile").textContent = d.path || "";
+      $("cfgtext").value = d.yaml || "";
+      cfgLoaded = true; cfgDirty = false;
+      $("cfgstate").textContent = d.error ? "" : "已载入";
+      if (d.error) { $("cfgerr").hidden = false; $("cfgerr").textContent = d.error; }
+    }).catch(function (e) {
+      $("cfgstate").textContent = "";
+      $("cfgerr").hidden = false; $("cfgerr").textContent = e.message;
+    });
+  }
+  $("cfgbox").addEventListener("toggle", function () { if ($("cfgbox").open && !cfgLoaded) loadConfig(); });
+  $("cfgtext").addEventListener("input", function () { cfgDirty = true; $("cfgstate").textContent = "未保存"; });
+  $("cfgreload").addEventListener("click", function () {
+    if (cfgDirty && !confirm("放弃未保存的修改并重新载入？")) return;
+    loadConfig();
+  });
+  $("cfgsave").addEventListener("click", function () {
+    var btn = $("cfgsave");
+    btn.disabled = true;
+    $("cfgerr").hidden = true;
+    $("cfgstate").className = "muted";
+    $("cfgstate").textContent = "保存中";
+    api("/config", { method: "PUT", headers: { "Content-Type": "application/yaml; charset=utf-8" }, body: $("cfgtext").value })
+      .then(function () {
+        cfgDirty = false;
+        $("cfgstate").className = "okmsg";
+        $("cfgstate").textContent = "已保存并热加载 " + fmtTime(new Date());
+        poll();
+      })
+      .catch(function (e) {
+        $("cfgstate").className = "muted";
+        $("cfgstate").textContent = "未保存";
+        $("cfgerr").hidden = false;
+        $("cfgerr").textContent = e.message;
+      })
+      .finally(function () { btn.disabled = false; });
+  });
+
+  $("onlyFailover").addEventListener("change", renderEvents);
+
+  // ---------- 轮询 ----------
+  var timer = null, inflight = false;
+  function poll() {
+    if (inflight) return;
+    inflight = true;
+    api("/status").then(function (st) {
+      lastStatus = st;
+      $("ver").textContent = st.version || "";
+      $("uptime").textContent = fmtDur(st.uptime_seconds);
+      $("cfgpath").textContent = st.config_path || "";
+      $("cfgpath").title = st.config_path || "";
+      var groups = st.groups || [];
+      var anyDown = groups.some(function (g) { return !g.active; });
+      var anyBad = groups.some(function (g) { return (g.upstreams || []).some(function (u) { return u.status === "unhealthy"; }); });
+      if (anyDown) setConn("err", "已连接 · 有线路组无可用线路");
+      else if (anyBad) setConn("warn", "已连接 · 部分线路故障");
+      else setConn("ok", "已连接");
+      notice("");
+      renderGroups(st);
+      return pullEvents(st.last_seq || 0);
+    }).catch(function (e) {
+      if (e.status === 401) {
+        setConn("err", "令牌无效");
+        notice("没有权限读取状态：请直接从本机浏览器打开本页，或从托盘「打开面板」进入。", true);
+      } else {
+        setConn("err", "未连接");
+        notice("无法连接内核：" + e.message + "（每 2 秒重试）", true);
+      }
+    }).finally(function () { inflight = false; });
+  }
+
+  // 本机直接打开时内核会种 cookie，因此不需要手工带令牌；
+  // 从托盘打开时带 #token=…，两种方式都可用。
+  renderEvents();
+  poll();
+  timer = setInterval(poll, 2000);
+  window.addEventListener("hashchange", function () { location.reload(); });
+})();
+</script>
+</body>
+</html>

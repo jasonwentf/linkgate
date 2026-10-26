@@ -1,0 +1,13 @@
+# 构建产物与运行时文件
+/bin/
+/dist/
+*.exe
+*.log
+*.test
+
+# 系统
+.DS_Store
+
+# 真实配置与令牌绝不入库
+config.local.yaml
+*.local.yaml

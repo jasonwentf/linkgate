@@ -1,0 +1,413 @@
+package app
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"linkgate/internal/ui"
+)
+
+// AdminServer 提供本机管理接口与面板。
+//
+// 安全边界：只应监听回环地址；所有 /v1 接口都要求 X-Linkgate-Token，
+// 写接口额外校验 Origin，避免浏览器里的恶意页面越权改配置。
+type AdminServer struct {
+	mu        sync.RWMutex
+	cfg       *Config
+	engine    *Engine
+	store     *Store
+	events    *EventLog
+	apply     func(*Config) error
+	cfgPath   string
+	log       *slog.Logger
+	token     string
+	startedAt time.Time
+	version   string
+	prober    Prober
+}
+
+// Prober 是即时探测能力（由 HealthMonitor 实现）。
+type Prober interface {
+	ProbeNow(group, name string) (bool, time.Duration, string)
+}
+
+func NewAdminServer(cfg *Config, engine *Engine, store *Store, events *EventLog,
+	apply func(*Config) error, cfgPath string, logger *slog.Logger) *AdminServer {
+	a := &AdminServer{
+		cfg:       cfg,
+		engine:    engine,
+		store:     store,
+		events:    events,
+		apply:     apply,
+		cfgPath:   cfgPath,
+		log:       logger,
+		startedAt: time.Now(),
+		version:   Version,
+	}
+	a.token = loadOrCreateToken(cfg)
+	return a
+}
+
+// SetVersion 让 main 把构建版本传给面板。
+func (a *AdminServer) SetVersion(v string) {
+	a.mu.Lock()
+	a.version = v
+	a.mu.Unlock()
+}
+
+// Token 返回管理令牌（托盘程序读取）。
+func (a *AdminServer) Token() string { return a.token }
+
+func loadOrCreateToken(cfg *Config) string {
+	path := cfg.Admin.TokenFile
+	if path == "" {
+		path = filepath.Join(ExpandPath(cfg.DataDir), "admin.token")
+	}
+	path = ExpandPath(path)
+	if b, err := os.ReadFile(path); err == nil {
+		if s := strings.TrimSpace(string(b)); len(s) >= 16 {
+			return s
+		}
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	tok := hex.EncodeToString(buf)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err == nil {
+		_ = os.WriteFile(path, []byte(tok+"\n"), 0o600)
+	}
+	return tok
+}
+
+func (a *AdminServer) Update(cfg *Config) {
+	a.mu.Lock()
+	a.cfg = cfg
+	a.mu.Unlock()
+}
+
+func (a *AdminServer) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/__linkgate/v1/health", a.handleHealth)
+	mux.HandleFunc("/__linkgate/v1/status", a.auth(a.handleStatus))
+	mux.HandleFunc("/__linkgate/v1/events", a.auth(a.handleEvents))
+	mux.HandleFunc("/__linkgate/v1/config", a.auth(a.handleConfig))
+	mux.HandleFunc("/__linkgate/v1/probe", a.auth(a.handleProbe))
+	mux.HandleFunc("/__linkgate/v1/toggle", a.auth(a.handleToggle))
+	mux.HandleFunc("/__linkgate/v1/reload", a.auth(a.handleReload))
+	mux.HandleFunc("/__linkgate/ui", a.handleUI)
+	mux.HandleFunc("/", a.handleUI)
+	return mux
+}
+
+func (a *AdminServer) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Linkgate-Token") != a.token && !a.cookieOK(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "缺少或错误的 X-Linkgate-Token"})
+			return
+		}
+		if r.Method != http.MethodGet && r.Header.Get("Origin") != "" {
+			if !originMatchesHost(r.Header.Get("Origin"), r.Host) {
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": "Origin 不被允许"})
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+// cookieOK 只在本机直接打开面板时生效：导航请求（Sec-Fetch-Site 为 none 或缺失）
+// 会被种一个 SameSite=Strict 的 cookie，省去手工复制令牌。
+func (a *AdminServer) cookieOK(r *http.Request) bool {
+	c, err := r.Cookie("linkgate_token")
+	if err != nil || c.Value != a.token {
+		return false
+	}
+	if !isLoopback(r.RemoteAddr) {
+		return false
+	}
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "none", "same-origin":
+		return true
+	}
+	return false
+}
+
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// originMatchesHost 按请求实际的 Host 判断同源，而不是按配置里的监听地址。
+// 监听地址写成 :8766 时，用局域网 IP 打开面板也必须能用。
+func originMatchesHost(origin, host string) bool {
+	if origin == "" || host == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	if strings.EqualFold(u.Host, host) {
+		return true
+	}
+	oh, _, err1 := splitHostPort(u.Host)
+	hh, _, err2 := splitHostPort(host)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return isLoopbackHost(oh) && isLoopbackHost(hh)
+}
+
+func isLoopbackHost(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+}
+
+func splitHostPort(addr string) (string, string, error) {
+	i := strings.LastIndex(addr, ":")
+	if i <= 0 {
+		return "", "", fmt.Errorf("bad addr %q", addr)
+	}
+	return addr[:i], addr[i+1:], nil
+}
+
+func (a *AdminServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"version": a.version,
+		"uptime":  int64(time.Since(a.startedAt).Seconds()),
+	})
+}
+
+func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "只支持 GET"})
+		return
+	}
+	a.mu.RLock()
+	cfg := a.cfg
+	ver := a.version
+	a.mu.RUnlock()
+
+	type status struct {
+		Version   string       `json:"version"`
+		StartedAt time.Time    `json:"started_at"`
+		UptimeSec int64        `json:"uptime_seconds"`
+		Config    string       `json:"config_path"`
+		Groups    []GroupState `json:"groups"`
+		LastSeq   uint64       `json:"last_seq"`
+	}
+	writeJSON(w, http.StatusOK, status{
+		Version:   ver,
+		StartedAt: a.startedAt,
+		UptimeSec: int64(time.Since(a.startedAt).Seconds()),
+		Config:    a.cfgPath,
+		Groups:    a.store.Snapshot(cfg),
+		LastSeq:   a.events.LastSeq(),
+	})
+}
+
+func (a *AdminServer) handleEvents(w http.ResponseWriter, r *http.Request) {
+	after := parseUint(r.URL.Query().Get("after"))
+	limit := int(parseUint(r.URL.Query().Get("limit")))
+	if limit <= 0 {
+		limit = 200
+	}
+	var evs []Event
+	if after > 0 {
+		evs = a.events.Since(after, limit)
+	} else {
+		evs = a.events.Recent(limit)
+	}
+	last := a.events.LastSeq()
+	writeJSON(w, http.StatusOK, map[string]any{"events": evs, "last_seq": last})
+}
+
+func (a *AdminServer) handleConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		b, err := os.ReadFile(ExpandPath(a.cfgPath))
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"path": a.cfgPath, "yaml": "", "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"path": a.cfgPath, "yaml": string(b)})
+	case http.MethodPut, http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		next, err := Parse(body)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		if err := a.saveAndApply(body, next); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "只支持 GET/PUT"})
+	}
+}
+
+func (a *AdminServer) saveAndApply(raw []byte, next *Config) error {
+	path := ExpandPath(a.cfgPath)
+	if old, err := os.ReadFile(path); err == nil {
+		_ = os.WriteFile(path+".bak", old, 0o600)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return err
+	}
+	if err := a.apply(next); err != nil {
+		return fmt.Errorf("配置已写入但热加载失败: %w", err)
+	}
+	a.Update(next)
+	a.events.Add(Event{Level: "info", Kind: "config", Message: "面板保存并热加载了配置"})
+	return nil
+}
+
+func (a *AdminServer) handleProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "只支持 POST"})
+		return
+	}
+	group := r.URL.Query().Get("group")
+	name := r.URL.Query().Get("upstream")
+	a.mu.RLock()
+	p := a.prober
+	a.mu.RUnlock()
+	if p == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "探针未就绪"})
+		return
+	}
+	ok, latency, msg := p.ProbeNow(group, name)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": ok, "latency_ms": latency.Milliseconds(), "error": msg,
+	})
+}
+
+func (a *AdminServer) handleToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "只支持 POST"})
+		return
+	}
+	group := r.URL.Query().Get("group")
+	name := r.URL.Query().Get("upstream")
+	if !a.exists(group, name) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "没有这条线路：" + group + "/" + name})
+		return
+	}
+	enabled := r.URL.Query().Get("enabled") != "false"
+	a.store.SetEnabled(group, name, enabled)
+	a.events.Add(Event{Level: "info", Kind: "config", Group: group, Upstream: name,
+		Message: fmt.Sprintf("线路运行时%s（重启后恢复配置文件设置）", map[bool]string{true: "启用", false: "停用"}[enabled])})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": enabled})
+}
+
+// SetProber 注册探针实现。
+func (a *AdminServer) SetProber(p Prober) {
+	a.mu.Lock()
+	a.prober = p
+	a.mu.Unlock()
+}
+
+func (a *AdminServer) exists(group, name string) bool {
+	a.mu.RLock()
+	cfg := a.cfg
+	a.mu.RUnlock()
+	g := cfg.Group(group)
+	if g == nil {
+		return false
+	}
+	return findUpstream(g, name) != nil
+}
+
+// handleReload 只重新读取配置文件并应用，不写盘，也不产生 .bak。
+// 托盘上的「重新加载配置」走这个接口。
+func (a *AdminServer) handleReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "只支持 POST"})
+		return
+	}
+	next, err := Load(a.cfgPath)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := a.apply(next); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	a.Update(next)
+	a.events.Add(Event{Level: "info", Kind: "config", Message: "重新读取配置文件并应用"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *AdminServer) handleUI(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" && r.URL.Path != "/__linkgate/ui" && r.URL.Path != "/__linkgate/ui/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if isLoopback(r.RemoteAddr) {
+		switch r.Header.Get("Sec-Fetch-Site") {
+		case "", "none":
+			http.SetCookie(w, &http.Cookie{
+				Name:     "linkgate_token",
+				Value:    a.token,
+				Path:     "/__linkgate/",
+				HttpOnly: true,
+				SameSite: http.SameSiteStrictMode,
+			})
+		}
+	}
+	b, err := ui.IndexHTML()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write(b)
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(code)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
+}
+
+func parseUint(s string) uint64 {
+	var v uint64
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return v
+		}
+		v = v*10 + uint64(c-'0')
+	}
+	return v
+}

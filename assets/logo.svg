@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#0F9D8F" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 两条线路从左侧汇聚，合成一条向右输出。几何与 tools/genicons 保持一致。 -->
+  <path d="M3 5.5C9 5.5 10 12 15 12"/>
+  <path d="M3 18.5C9 18.5 10 12 15 12"/>
+  <path d="M15 12H21"/>
+</svg>

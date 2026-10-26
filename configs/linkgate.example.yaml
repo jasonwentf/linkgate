@@ -1,0 +1,71 @@
+# Linkgate 配置示例。
+# 真实地址请写在你自己的 ~/.linkgate/config.yaml，不要改进仓库。
+# 生成一份可用的初始配置：linkgate -init
+version: 1
+
+admin:
+  listen: 127.0.0.1:8766
+
+log:
+  level: info
+  format: text
+
+# 请求体常达数 MB：小于 8MiB 放内存，超过落临时文件
+buffer:
+  max_request_bytes: 134217728
+  spill_threshold: 8388608
+  max_concurrent: 64
+
+http:
+  connect_timeout: 2s
+  tls_handshake_timeout: 5s
+  response_header_timeout: 900s   # 模型可能长时间思考，首字节要放宽
+  stream_idle_timeout: 900s       # 流中途多久没数据算卡死
+  upload_idle_timeout: 60s        # 上传请求体多久没有进展算卡死
+  response_header_warn_after: 120s
+  keep_alive: 30s
+
+retry:
+  max_attempts: 3
+  mode: connect                   # 只在连接未建立时换线路，避免重复计费
+  backoff: 150ms
+
+health:
+  enabled: true
+  interval: 15s
+  timeout: 3s
+  fail_threshold: 2
+  recover_threshold: 2
+  cooldown: 20s
+  probe_path: /health
+
+groups:
+  - name: axonhub
+    listen: 127.0.0.1:8765
+    # 优先级：数字越小越先走。同优先级按书写顺序。
+    upstreams:
+      # FRP 中转（阿里云）—— 打通后放最前
+      - name: relay
+        url: https://axonhub.example.com
+        priority: 5
+        host: axonhub.example.com
+
+      - name: tailscale
+        url: http://203.0.113.10:8090
+        priority: 10
+
+      - name: zerotier
+        url: http://198.51.100.20:8090
+        priority: 20
+
+      # Cloudflare Tunnel；开了 Access 才需要下面两个头
+      - name: cloudflare
+        url: https://axonhub-cf.example.com
+        priority: 30
+        host: axonhub-cf.example.com
+        headers:
+          CF-Access-Client-Id: "<ID>"
+          CF-Access-Client-Secret: "<SECRET>"
+        health_path: /health
+        max_body_bytes: 2097152      # CF 边缘约 100s 就 524，大请求别排给它
+        failure_statuses: [524]      # 524 只可能由 CF 产生，可安全计为线路故障

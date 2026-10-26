@@ -1,0 +1,318 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"linkgate/internal/app"
+)
+
+var (
+	version = "0.1.0-dev"
+	commit  = "dev"
+)
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "linkgate:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	configPath := flag.String("config", app.DefaultPath(), "配置文件路径（默认 ~/.linkgate/config.yaml）")
+	checkOnly := flag.Bool("check", false, "只校验配置，然后退出")
+	doctor := flag.Bool("doctor", false, "逐条探测线路并打印结果，然后退出")
+	initConfig := flag.Bool("init", false, "在配置文件路径写入一份示例配置")
+	showVersion := flag.Bool("version", false, "打印版本后退出")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("linkgate %s (%s)\n", version, commit)
+		return nil
+	}
+
+	if *initConfig {
+		return writeExample(*configPath)
+	}
+
+	cfg, err := app.Load(*configPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("找不到配置文件 %s\n提示：先运行 linkgate -init 生成示例配置，再按你的线路改写", *configPath)
+		}
+		return err
+	}
+
+	if *checkOnly {
+		fmt.Printf("配置有效：%d 个线路组，%d 条线路\n", len(cfg.Groups), countUpstreams(cfg))
+		return nil
+	}
+
+	logger, closer, err := app.NewLogger(cfg)
+	if err != nil {
+		return err
+	}
+	if closer != nil {
+		defer closer.Close()
+	}
+
+	events := app.NewEventLog(cfg.Log.RingSize)
+	th := thresholds(cfg)
+	store := app.NewStore(cfg, th)
+	monitor := app.NewHealthMonitor(cfg, store, events, logger)
+
+	if *doctor {
+		return runDoctor(cfg, monitor)
+	}
+
+	engine, err := app.NewEngine(cfg, store, events, logger)
+	if err != nil {
+		return err
+	}
+	defer engine.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go monitor.Start(ctx)
+	defer monitor.Stop()
+
+	apply := func(next *app.Config) error {
+		if err := next.Validate(); err != nil {
+			return err
+		}
+		store.Load(next, thresholds(next), store)
+		if err := engine.Reload(next); err != nil {
+			return err
+		}
+		monitor.Update(next)
+		return nil
+	}
+
+	admin := app.NewAdminServer(cfg, engine, store, events, apply, *configPath, logger)
+	admin.SetProber(monitor)
+	admin.SetVersion(version)
+
+	// 组监听
+	type listener struct {
+		name string
+		srv  *http.Server
+		ln   net.Listener
+	}
+	var listeners []listener
+	closeAll := func() {
+		for _, l := range listeners {
+			shutdownCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = l.srv.Shutdown(shutdownCtx)
+			c()
+			_ = l.ln.Close()
+		}
+	}
+	defer closeAll()
+
+	for _, g := range cfg.Groups {
+		ln, err := net.Listen("tcp", g.Listen)
+		if err != nil {
+			return fmt.Errorf("监听 %s (%s) 失败: %w", g.Name, g.Listen, err)
+		}
+		srv := &http.Server{
+			Handler:           engine.Handler(g.Name),
+			ReadHeaderTimeout: 30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			// 不设 WriteTimeout：流式响应可能持续数十分钟
+		}
+		listeners = append(listeners, listener{name: g.Name, srv: srv, ln: ln})
+		go func(name string, s *http.Server, l net.Listener) {
+			logger.Info("listening", "group", name, "addr", l.Addr().String())
+			if err := s.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("server stopped", "group", name, "err", err)
+			}
+		}(g.Name, srv, ln)
+		events.Add(app.Event{Level: "info", Kind: "start", Group: g.Name, Message: "线路组已启动，监听 " + g.Listen})
+	}
+
+	// 管理接口
+	if !cfg.Admin.Disabled {
+		ln, err := net.Listen("tcp", cfg.Admin.Listen)
+		if err != nil {
+			return fmt.Errorf("管理接口监听 %s 失败: %w", cfg.Admin.Listen, err)
+		}
+		adminSrv := &http.Server{
+			Handler:           admin.Handler(),
+			ReadHeaderTimeout: 15 * time.Second,
+			WriteTimeout:      30 * time.Second,
+		}
+		listeners = append(listeners, listener{name: "admin", srv: adminSrv, ln: ln})
+		go func() {
+			logger.Info("admin listening", "addr", ln.Addr().String())
+			if err := adminSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("admin server stopped", "err", err)
+			}
+		}()
+	}
+
+	events.Add(app.Event{Level: "info", Kind: "start", Message: fmt.Sprintf("Linkgate %s 已启动", version)})
+	printBanner(cfg, *configPath)
+
+	// 热重载：SIGHUP（Windows 下由 watchSignals 处理为空）
+	hup := make(chan os.Signal, 1)
+	watchHangup(hup)
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	for {
+		select {
+		case <-hup:
+			next, err := app.Load(*configPath)
+			if err != nil {
+				logger.Error("reload failed", "err", err)
+				events.Add(app.Event{Level: "error", Kind: "config", Message: "重载失败: " + err.Error()})
+				continue
+			}
+			if err := apply(next); err != nil {
+				logger.Error("reload failed", "err", err)
+				events.Add(app.Event{Level: "error", Kind: "config", Message: "重载失败: " + err.Error()})
+				continue
+			}
+			logger.Info("config reloaded")
+		case sig := <-stop:
+			logger.Info("shutting down", "signal", sig.String())
+			return nil
+		}
+	}
+}
+
+// runDoctor 逐条探测线路，输出人可读的结果。排障时单独跑一次即可，不启动服务。
+func runDoctor(cfg *app.Config, monitor *app.HealthMonitor) error {
+	fmt.Printf("逐条探测 %d 条线路（超时 %s）…\n\n", countUpstreams(cfg), cfg.Health.Timeout.Duration)
+	failures := 0
+	for _, g := range cfg.Groups {
+		fmt.Printf("[%s]  %s\n", g.Name, g.Listen)
+		for _, u := range g.Upstreams {
+			ok, latency, msg := monitor.ProbeNow(g.Name, u.Name)
+			mark := "OK  "
+			if !ok {
+				mark = "FAIL"
+				failures++
+			}
+			if msg == "" {
+				msg = "HTTP 2xx/3xx"
+			}
+			fmt.Printf("  %-4s %-14s %7dms  %s\n", mark, u.Name, latency.Milliseconds(), msg)
+		}
+		fmt.Println()
+	}
+	if failures > 0 {
+		return fmt.Errorf("%d 条线路探测失败", failures)
+	}
+	fmt.Println("全部线路可达。")
+	return nil
+}
+
+func thresholds(cfg *app.Config) app.Thresholds {
+	return app.Thresholds{
+		FailThreshold:    cfg.Health.FailThreshold,
+		RecoverThreshold: cfg.Health.RecoverThreshold,
+		Cooldown:         cfg.Health.Cooldown.Duration,
+	}
+}
+
+func countUpstreams(cfg *app.Config) int {
+	n := 0
+	for _, g := range cfg.Groups {
+		n += len(g.Upstreams)
+	}
+	return n
+}
+
+func printBanner(cfg *app.Config, configPath string) {
+	var lines []string
+	for _, g := range cfg.Groups {
+		var names []string
+		for _, u := range g.Upstreams {
+			names = append(names, u.Name)
+		}
+		sort.Strings(names)
+		lines = append(lines, fmt.Sprintf("  %-10s %-18s %s", g.Name, g.Listen, strings.Join(names, " → ")))
+	}
+	fmt.Printf("Linkgate %s\n配置：%s\n线路：\n%s\n", version, configPath, strings.Join(lines, "\n"))
+	if !cfg.Admin.Disabled {
+		fmt.Printf("面板：http://%s/__linkgate/ui\n", cfg.Admin.Listen)
+	}
+	fmt.Println("按 Ctrl-C 停止")
+}
+
+func writeExample(path string) error {
+	example := `# Linkgate 配置示例。真实地址请按你自己的线路改写。
+version: 1
+
+admin:
+  listen: 127.0.0.1:8766
+
+log:
+  level: info
+  format: text
+
+# 请求体常达数 MB：小于 8MiB 放内存，超过落临时文件
+buffer:
+  max_request_bytes: 134217728
+  spill_threshold: 8388608
+  max_concurrent: 64
+
+http:
+  connect_timeout: 2s
+  tls_handshake_timeout: 5s
+  response_header_timeout: 900s   # 模型可能长时间思考，首字节要放宽
+  stream_idle_timeout: 900s       # 流中途多久没数据算卡死
+  upload_idle_timeout: 60s        # 上传请求体多久没有进展算卡死
+  keep_alive: 30s
+
+retry:
+  max_attempts: 3
+  mode: connect                   # 只在连接未建立时换线路，避免重复计费
+
+health:
+  enabled: true
+  interval: 15s
+  timeout: 3s
+  fail_threshold: 2
+  recover_threshold: 2
+  probe_path: /health
+
+groups:
+  - name: axonhub
+    listen: 127.0.0.1:8765
+    upstreams:
+      - name: relay
+        url: https://axonhub.example.com
+        priority: 10
+        host: axonhub.example.com
+        headers: {}
+      - name: tailscale
+        url: http://203.0.113.10:8090
+        priority: 20
+      - name: zerotier
+        url: http://198.51.100.20:8090
+        priority: 30
+`
+	path = app.ExpandPath(path)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("%s 已存在，拒绝覆盖", path)
+	}
+	return os.WriteFile(path, []byte(example), 0o600)
+}
