@@ -14,7 +14,7 @@ import (
 )
 
 func TestVersionDefaultAndLdflagsInjection(t *testing.T) {
-	if app.Version != "0.2.1" || version != app.Version {
+	if app.Version != "0.2.2" || version != app.Version {
 		t.Fatalf("default main=%s app=%s", version, app.Version)
 	}
 	bin := filepath.Join(t.TempDir(), "linkgate")

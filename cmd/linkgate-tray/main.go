@@ -29,10 +29,19 @@ import (
 )
 
 // version 可用 -ldflags "-X main.version=x.y.z" 覆盖；连上内核后以内核版本为准。
-var version = app.Version
+var version string
+
+func init() {
+	if version == "" {
+		version = app.Version
+	}
+}
 
 //go:embed icons/tray-mac.png
 var iconMac []byte
+
+//go:embed icons/logo.png
+var iconLogo []byte
 
 //go:embed icons/tray-win.ico
 var iconWin []byte
@@ -396,7 +405,12 @@ func (t *tray) onReady() {
 	if runtime.GOOS == "darwin" {
 		systray.SetTemplateIcon(iconMac, iconMac)
 	} else {
-		systray.SetIcon(iconWin)
+		icon, err := windowsIcon(iconLogo)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			icon = iconWin // Retain the generated ICO if the PNG is ever invalid.
+		}
+		systray.SetIcon(icon)
 	}
 	systray.SetTooltip("Linkgate")
 
@@ -595,7 +609,12 @@ func main() {
 	configPath := flag.String("config", defaultConfigPath(), "配置文件路径（默认 LINKGATE_CONFIG 或 ~/.linkgate/config.yaml）")
 	adminAddr := flag.String("admin", "", "管理接口地址，覆盖配置里的 admin.listen（也可用 LINKGATE_ADMIN）")
 	once := flag.Bool("once", false, "只拉取一次状态并打印菜单摘要，然后退出（用于排查）")
+	showVersion := flag.Bool("version", false, "打印托盘版本后退出")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("linkgate-tray %s\n", version)
+		return
+	}
 
 	s := loadSettings(expand(*configPath), *adminAddr)
 	t := newTray(s)

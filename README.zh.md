@@ -212,17 +212,35 @@ groups:
 
 如需卸载后台服务，可运行 `./scripts/uninstall-macos.sh`。卸载脚本只会移除启动项与二进制程序，会完整保留 `~/.linkgate/` 下的配置文件与令牌。
 
-### Windows（计划任务）
+### Windows
 
-在 Windows 环境下，先使用编译好的可执行文件初始化配置并填入你的真实线路，再通过 PowerShell 运行部署脚本：
+![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)
+
+Windows 10/11 x64 使用预编译 ZIP，不需要安装 Go，也不需要管理员权限。
+
+1. 打开 [Releases](https://github.com/jasonwentf/linkgate/releases)，下载 `linkgate_x.x.x_windows_amd64.zip`，例如 `linkgate_0.2.2_windows_amd64.zip`。
+2. 右键 ZIP → **全部解压缩**，进入解压后的文件夹，不要在压缩包预览中运行。
+3. 双击 `install.bat`，等到显示 `Installed Linkgate` 后按任意键关闭窗口。脚本会把两个 EXE 复制到 `%LOCALAPPDATA%\Linkgate`，仅在配置不存在时自动执行 `-init`，然后启动内核与托盘。
+4. 点击右下角的彩色 Linkgate logo → **打开面板**。如果看不到图标，先点托盘的 **^** 隐藏图标箭头。在面板中添加你的服务与线路；初始配置里的示例地址不能直接作为真实后端使用。
+
+内核通过当前用户的登录计划任务自启，崩溃后自动拉起；托盘通过启动文件夹的快捷方式自启，使用同一份配置。已有配置与令牌不会被覆盖。下载文件尚未签名，若 SmartScreen 拦截，请先核实来自本仓库并对照 `checksums.txt`，再点 **更多信息 → 仍要运行**。受管理的电脑可能禁止脚本或计划任务，安装器会报错，不会自动提权。
+
+#### 检查与安装更新
+
+双击 `%LOCALAPPDATA%\Linkgate\check-update.bat`，即可比较已安装版本与 GitHub 最新稳定版。这是手动触发的匿名请求，不下载或替换二进制。内核与托盘也都支持 `-version` 查看各自版本。
+
+1. 下载新版 `linkgate_x.x.x_windows_amd64.zip`，解压到一个新的文件夹。
+2. 等当前请求完成，双击**新文件夹里的** `update.bat`，看到确认提示后输入 `YES`。
+3. 脚本先校验新版兼容现有配置、内核与托盘版本一致，并拒绝降级；把旧 EXE 备份到 `%LOCALAPPDATA%\Linkgate\backups`，按“托盘 → 内核”顺序停止，替换两个 EXE，再重新启动。配置与令牌保持不变。Windows 的任务/进程终止会中断在途请求，不是优雅排空。
+4. 从托盘打开面板检查服务状态。替换或启动失败时，脚本会尝试恢复两个旧 EXE，并给出备份路径。手工回滚时，先停止 Linkgate 计划任务并退出托盘，把备份中的两个 EXE 复制回安装目录，再启动计划任务与托盘快捷方式。
+
+源码使用者可先运行 `make dist`，再执行：
 
 ```powershell
-.\bin\dist\linkgate-windows-amd64.exe -init
-notepad "$env:USERPROFILE\.linkgate\config.yaml"
-.\deploy\windows\install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\install.ps1 -SourceDir .\bin\dist
 ```
 
-安装脚本会将 `linkgate.exe` 与可选的托盘程序 `linkgate-tray.exe` 复制到安装目录，并在系统计划任务中注册登录自启与崩溃恢复策略，同时创建托盘启动快捷方式。
+自定义配置可通过 `-Config` 指定，更新会沿用安装时的路径。从已解压的 ZIP 更新无需联网，只有 `check-update.bat` 需要访问 GitHub。
 
 ### Linux（systemd）
 

@@ -107,7 +107,7 @@ try:
         time.sleep(.1)
     else:
         raise RuntimeError('startup timeout')
-    assert status['version'] == '0.2.1'
+    assert status['version'] == '0.2.2'
     results = {}
     for line, code, cls in [('auth', 401, 'auth'), ('notfound', 404, 'notfound'), ('healthy', 200, 'healthy')]:
         result = request('/__linkgate/v1/probe?group=smoke-auth&upstream=' + line, 'POST')

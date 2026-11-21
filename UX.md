@@ -105,7 +105,9 @@ UA 只用于统计展示，不参与选路。面板的「调用方 → 线路」
 ## 8. 平台惯例
 
 - macOS 菜单栏图标用 template image，跟随明暗；面板默认窗口 1000×760。
-- Windows 托盘图标 32×32 ico。
+- Windows 托盘用 32×32 彩色 logo PNG，运行时转 32bpp ICO 后传给 systray；macOS 保持黑白 template image。
+- Windows 安装入口为解压后的 `install.bat`，无需手工初始化配置；完成后提示点击右下角 logo →「打开面板」，并提醒示例线路需替换。
+- Windows 更新分为 `check-update.bat` 的手动版本检查与新包 `update.bat` 的离线替换；替换前明确提示请求中断并要求输入 `YES`，失败保留备份并尝试恢复。
 - 面板窗口用 Chrome/Edge app 模式，无地址栏；找不到浏览器则回退默认浏览器。
 - 托盘「退出」只退出托盘，内核继续运行。
 - ⌘J（Windows/Linux 为 Ctrl+J）切换底部抽屉；抽屉高度、当前标签与展开状态存 localStorage，换机不同步。

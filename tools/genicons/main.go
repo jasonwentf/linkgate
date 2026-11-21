@@ -4,9 +4,10 @@
 //
 // 输出（结果确定，可重复生成）：
 //
+//	assets/logo.png                     32x32 彩色 logo，Windows 运行时转成 ICO
 //	assets/tray-mac.png                 44x44（22pt @2x）黑色 + 透明，macOS template image
 //	assets/tray-win.ico                 16/32/48，强调色，32bpp BMP 条目
-//	cmd/linkgate-tray/icons/*           同上两份的副本，供 go:embed 使用
+//	cmd/linkgate-tray/icons/*           同上三份的副本，供 go:embed 使用
 package main
 
 import (
@@ -208,6 +209,13 @@ func main() {
 
 	// Windows：强调色在深浅任务栏上都可辨认。
 	accent := color.NRGBA{0x0F, 0x9D, 0x8F, 255}
+	logoPNG, err := encodePNG(toNRGBA(render(32, segs), accent))
+	if err != nil {
+		fail(err)
+	}
+	if err := writeAll("logo.png", logoPNG, assetsDir, embedDir); err != nil {
+		fail(err)
+	}
 	var winImgs []*image.NRGBA
 	for _, s := range []int{16, 32, 48} {
 		winImgs = append(winImgs, toNRGBA(render(s, segs), accent))
