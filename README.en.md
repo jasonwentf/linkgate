@@ -1,210 +1,124 @@
 # Linkgate
 
-A local failover proxy for AI backends. Point all your tools at one address; Linkgate tries multiple routes and switches when one goes down.
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Platform: macOS | Windows | Linux](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)
 
-[中文](README.md)
+Linkgate is a transparent HTTP reverse proxy that runs locally. It gives every client tool on your machine one fixed local address, and silently fails over between multiple upstream routes in the background.
 
-## The problem
+When you run tools like Claude Code, Cursor, Codex, or OpenCode against a remote inference service, that backend usually sits behind several paths at once — Tailscale, ZeroTier, a Cloudflare Tunnel, a self-hosted FRP relay. Hardcode any one of those addresses into every tool, and the moment that tunnel flaps or drops, everything errors at once and you end up editing configs by hand. Linkgate listens on a fixed local port instead. Clients point at localhost; it picks the first reachable route and forwards. Clients never see the switch.
 
-You run several AI tools (Claude Code, Cursor, OpenCode, etc.) against the same backend. Each has the backend URL hardcoded in its config. When that route breaks, every tool fails at once, and you have to update each one by hand.
+Everything it forwards stays transparent. It moves bytes without touching the request body, the `Authorization` header, or model parameters, and it leaves gzip handling alone by default. It does not parse traffic to count tokens — it only counts requests, failures, failovers, and latency. To prevent double-billing or duplicated work upstream, it only fails over before a single byte has been sent. Once a connection is established, a stalled header or a broken stream returns `502`; it never replays a request on another route.
 
-Linkgate listens on a local port. All tools point there. It tries routes in priority order and falls back to the next one if a connection cannot be established. The tools never notice the switch.
+## How it works
 
-## Three invariants
+A **service** (`groups` in the config) is a local listen port plus the backend it forwards to. You can run several, one port each. Under every service you attach **routes** (`upstreams`) — the paths that reach that backend — each tagged with a **channel** (`kind`: Tailscale, ZeroTier, Cloudflare Tunnel, FRP, direct, or your own label). When the top route can't establish a connection, Linkgate moves down the priority list.
 
-1. **Transparent forwarding.** Request body, Authorization header, model fields, and all other headers pass through untouched.
-2. **No replay after connection.** If a TCP connection was established (past DNS, dial, TLS), Linkgate returns 502 on failure instead of retrying. It cannot prove the upstream did not receive the request, so replaying risks double billing.
-3. **No token accounting.** Linkgate tracks request counts, failures, failovers, and latency. It never parses request bodies.
+Timeouts are layered so failover stays fast without punishing slow inference: connect `2s`, TLS handshake `5s` so a dead route fails quickly; upload idle `60s` measured on actual progress, so a big request body still finishes on a slow route; response-header and stream idle `900s` for thinking models that take minutes to emit a first byte; and `reconnect_after_idle` (default `60s`) redials pooled connections that went stale, turning a silent reuse failure into a clean connect failure that can legitimately trigger failover.
 
-## Quick start
+## Features
 
-Requires Go 1.27+.
+**Multi-route failover with request buffering.** Routes sort by priority, lowest number first. The request body is fully buffered on ingress (under `8 MiB` in memory, above that into a temp file, `128 MiB` cap) so a failed connect can be replayed to the next route intact. Per-route guards handle channel quirks — e.g. Cloudflare Tunnel's ~100s edge timeout can be excluded from large bodies via `max_body_bytes`, and `failure_statuses: [524]` marks that status as a route fault. Ordinary upstream `5xx` is treated as the backend's own problem, not a route failure.
+
+**Reachability-aware health probes.** Background probes (`http` or `tcp_connect`) plus real-request feedback track route health; routes past the failure threshold drop out of rotation, with unhealthy routes kept as last-resort fallbacks. A probe classifies results as `healthy`, `auth`, `notfound`, `server_error`, or `unreachable` — a `401` or `404` counts as *connected*, not broken, so an auth-gated endpoint doesn't look like a dead route.
+
+**UA rules (`ua_rules`).** Per service, ordered rules pin matching clients to a preferred route: `[{match, line, comment}]`, with substring / `exact:` / `prefix:` / `regex:` matching (case-insensitive). A pin is a preference, not a lock — an unhealthy target is still tried first and falls back on a clean connect failure. Rules are frozen per request, so in-flight requests keep their original target across config reloads.
+
+**Dashboard and caller→route flows.** A zero-dependency single-page panel (embedded HTML + vanilla JS) serves the UI. The dashboard shows every service with live route, health, and counters, sortable by config order / recency / volume. Each service page shows route cards plus a caller→route flow graph — callers are normalized to friendly classes (Claude Code, Codex, OpenCode, ZCode, curl, Python, …) and line width tracks request volume. Raw `User-Agent` strings are never stored.
+
+![Dashboard](docs/images/dashboard.png)
+
+**Structured editing with transactional saves.** Add, edit, delete services and routes through forms, or drag to reorder — no YAML hand-editing needed (a full-YAML editor remains under Settings → advanced). Every save validates, stages new listeners, writes a `.bak`, then atomically swaps the config; a failed preflight leaves the old runtime untouched.
+
+**Bottom drawer with dual event rings.** `⌘J` / `Ctrl+J` or a drag handle opens a global event and runtime drawer. Lifecycle events (failover, health, config) live in a separate ring from request logs, so a burst of request errors can't flush important entries.
+
+**Grouped settings with honest effect labels.** Settings are grouped (events & logs, health probe, retry, concurrency, HTTP timeouts, startup resources) with per-field labels: hot, next cycle, or restart-required. Startup resources save but only apply on restart.
+
+**Pure Go, cross-platform.** The kernel is dependency-free Go (no cgo): one static binary for macOS (arm64/amd64), Linux (amd64/arm64), Windows (amd64). An optional tray (`linkgate-tray`) shows the active route per service in the macOS menu bar / Windows tray.
+
+![Service page with flow graph](docs/images/service.png)
+
+## Getting started
+
+Requires Go 1.27.1+.
 
 ```bash
-# Build
-make build
-# Or: go build -trimpath -o bin/linkgate ./cmd/linkgate
-
-# Generate a sample config (defaults to ~/.linkgate/config.yaml)
-bin/linkgate -init
-
-# Edit the config with your own routes
-vi ~/.linkgate/config.yaml
-
-# Run
-bin/linkgate
-
-# Verify
-curl http://127.0.0.1:8765/health
+make build                 # build kernel to bin/linkgate
+./bin/linkgate -init       # write ~/.linkgate/config.yaml (won't overwrite)
+./bin/linkgate -check      # validate config
+./bin/linkgate -doctor     # probe every route, no listeners
+./bin/linkgate             # run
 ```
 
-`-init` writes a commented sample config. It refuses to overwrite an existing file.
+The panel opens at `http://127.0.0.1:8766/__linkgate/ui`. A `0600` admin token is generated at `~/.linkgate/admin.token` on first run. `make dist` cross-compiles all platform binaries into `bin/dist/`.
 
-Other flags: `-config <path>` for a custom config path, `-check` to validate without starting, `-doctor` to probe every route once, `-version` to print version.
-
-## Configuration
-
-See [`configs/linkgate.example.yaml`](configs/linkgate.example.yaml) for every field with comments. Key sections below.
-
-### Route groups
+## Config example
 
 ```yaml
+version: 1
+admin:
+  listen: 127.0.0.1:8766
+
 groups:
   - name: axonhub
     listen: 127.0.0.1:8765
+    protocol: http
+    ua_rules:
+      - match: claude-code
+        line: tailscale
+        comment: prefer Tailscale for Claude Code
     upstreams:
-      - name: relay
-        url: https://your-relay.example.com
-        priority: 5
-        host: your-relay.example.com
       - name: tailscale
-        url: http://100.x.x.x:8090
+        kind: ts
+        url: http://100.64.0.10:8090
         priority: 10
       - name: zerotier
-        url: http://10.x.x.x:8090
+        kind: zt
+        url: http://10.147.20.10:8090
         priority: 20
+      - name: cloudflare
+        kind: cf
+        url: https://cf-tunnel.example.com
+        priority: 30
+        max_body_bytes: 2097152
+        failure_statuses: [524]
 ```
 
-Priority is an integer. Lower numbers go first. Same priority follows file order. Each upstream can set its own `host`, `headers` (e.g. CF Access service tokens), and independent timeouts.
-
-### Timeouts
-
-```yaml
-http:
-  connect_timeout: 2s          # Fail fast if a route is down
-  tls_handshake_timeout: 5s
-  upload_idle_timeout: 60s      # No upload progress for this long = stuck (progress, not total time)
-  response_header_timeout: 900s # Models can think for minutes; don't treat that as failure
-  stream_idle_timeout: 900s     # No data for this long mid-stream = stuck
-```
-
-These can be overridden per group and adjusted at runtime through the dashboard.
-
-### Retry
-
-```yaml
-retry:
-  max_attempts: 3
-  mode: connect    # Only switch routes before the connection is established
-  backoff: 150ms
-```
-
-`mode: connect` is the default and only switches routes when no request header has been written yet; `none` disables switching.
-
-### Health checks
-
-```yaml
-health:
-  enabled: true
-  interval: 15s
-  timeout: 3s
-  fail_threshold: 2     # 2 consecutive probe failures → marked unhealthy
-  recover_threshold: 2  # 2 consecutive successes → restored
-  probe_path: /health
-```
-
-Upstream 5xx responses do not count as route failures — that is a backend problem, not a route problem. If a status code can only come from a specific route (for example Cloudflare's 524), declare it on that route with `failure_statuses: [524]`.
-
-Each route can also set `max_body_bytes`: requests larger than that never take that route (CF returns 524 after about 100 seconds, so large requests should not be routed there).
-
-### Request body buffering
-
-The full request body is read before forwarding so it can be replayed on a different route. Bodies under 8 MiB stay in memory; larger ones spill to a temp file. The hard limit is 128 MiB.
-
-## Cross-platform
-
-The core is pure Go with no cgo. `make dist` cross-compiles five targets in one pass:
-
-- `darwin/arm64`, `darwin/amd64`
-- `linux/amd64`, `linux/arm64`
-- `windows/amd64`
-
-The tray (`linkgate-tray`) is an optional GUI shell for macOS and Windows. The macOS build uses cgo (Xcode command-line tools required); the Windows systray implementation is pure Go, so the `.exe` can be cross-compiled from macOS. No tray on Linux.
-
-The core runs standalone. Open the dashboard in a browser.
-
-## Dashboard and tray
-
-The dashboard is an embedded single-page HTML file (vanilla JS, no framework), served by the admin interface:
-
-```
-http://127.0.0.1:8766/__linkgate/ui
-```
-
-It shows per-route status, latency, request counts, and an event log. You can edit the config, trigger a probe, or toggle routes on and off from here.
-
-The admin interface listens on `127.0.0.1:8766` by default, loopback only. On first start it writes a token to `~/.linkgate/admin.token` (mode 0600). API requests require the `X-Linkgate-Token` header.
-
-Key endpoints:
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/__linkgate/v1/status` | Version, uptime, per-route state and counters |
-| GET | `/__linkgate/v1/events?after=N` | Incremental events |
-| PUT | `/__linkgate/v1/config` | Submit YAML; validated, written to disk, hot-reloaded |
-| POST | `/__linkgate/v1/probe?group=&upstream=` | Probe a route immediately |
-| POST | `/__linkgate/v1/toggle?group=&upstream=&enabled=` | Enable/disable a route at runtime (not persisted) |
-
-On Unix, sending `SIGHUP` also triggers a config reload.
-
-The tray does two things: shows current status in the system tray, and opens the dashboard on click.
+See `configs/linkgate.example.yaml` for the full field reference.
 
 ## Deployment
 
-### macOS — LaunchAgent
+**macOS (launchd)** — `./scripts/install-macos.sh` builds, initializes config, and registers user LaunchAgents (auto-start, respawn). `./scripts/uninstall-macos.sh` removes the agents while keeping `~/.linkgate/`.
 
-```bash
-./scripts/install-macos.sh
-```
+**Windows (Scheduled Task)** — run `install.ps1` after `-init`; it copies the binaries, registers a logon task with crash-restart, and drops a tray shortcut.
 
-Builds the core and tray (tray needs Xcode CLI tools; skipped if unavailable), registers LaunchAgents, starts on login. Copies the sample config to `~/.linkgate/config.yaml` on first run.
+**Linux (systemd)** — copy the binary, config, and `deploy/linkgate.service`, then `systemctl enable --now linkgate`. The unit uses `ProtectSystem=strict` with only `/etc/linkgate` and `/var/lib/linkgate` writable.
 
-Uninstall: `./scripts/uninstall-macos.sh` (keeps config and token).
+## Management API
 
-### Linux — systemd
+Listens on `127.0.0.1:8766` only. All `/__linkgate/v1/*` endpoints (except `/health` and the panel) need the `X-Linkgate-Token` header; mutating calls also check `Origin`.
 
-```bash
-make build
-sudo cp bin/linkgate /usr/local/bin/
-sudo mkdir -p /etc/linkgate /var/lib/linkgate
-sudo cp configs/linkgate.example.yaml /etc/linkgate/config.yaml
-# Edit the config
-sudo vi /etc/linkgate/config.yaml
+| Method | Path | Purpose |
+| :--- | :--- | :--- |
+| `GET` | `/__linkgate/ui` | Web panel |
+| `GET` | `/__linkgate/v1/health` | Liveness (no token) |
+| `GET` | `/__linkgate/v1/status` | Live service/route state |
+| `GET` | `/__linkgate/v1/stats` | Counters, caller matrix, ring usage |
+| `GET` | `/__linkgate/v1/events` | Event stream (`group`/`stream`/`kind`/`after`/`limit`) |
+| `GET`/`PUT` | `/__linkgate/v1/settings` | Read / patch global settings (hot / next-cycle / restart) |
+| `PUT` | `/__linkgate/v1/ui/order` | Persist service sort |
+| `GET`/`PUT` | `/__linkgate/v1/config` | Read / submit full YAML |
+| `POST` | `/__linkgate/v1/reload` | Reload from disk (≈ `SIGHUP`) |
+| `POST`/`PUT`/`DELETE` | `/__linkgate/v1/groups[/<name>/upstreams]` | Service & route CRUD |
+| `PUT` | `/__linkgate/v1/groups/<name>/upstreams/order` | Reorder routes |
+| `POST` | `/__linkgate/v1/probe` | Probe one route |
+| `POST` | `/__linkgate/v1/toggle` | Runtime enable/disable a route |
 
-sudo cp deploy/linkgate.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now linkgate
-```
+## Roadmap
 
-### Windows — Scheduled Task
-
-```powershell
-# Generate config first
-.\dist\linkgate-windows-amd64.exe -init
-# Edit %USERPROFILE%\.linkgate\config.yaml, then:
-.\deploy\windows\install.ps1
-```
-
-Registers a scheduled task (starts on login, restarts on crash) and a startup shortcut for the tray.
-
-## Limitations
-
-Linkgate is a transport-layer proxy. The following are out of scope:
-
-- **Mid-stream disconnects.** Once the connection is up and bytes are flowing, no proxy can resume on a different connection. The harness must retry.
-- **Upstream 5xx.** Backend errors are not route failures. Linkgate does not switch routes on 5xx.
-- **Cloudflare 100-second timeout (524).** When a route goes through CF and model thinking exceeds 100 seconds, CF returns 524. The workaround is a route that does not go through CF.
-- **Model routing, protocol translation, token billing.** Linkgate does not parse request content. It does not know what a model is. It forwards bytes.
-- **System proxy.** The core ignores system proxy settings to avoid traffic looping through tools like Clash. If a route needs a proxy, handle it at the URL level.
-
-## Smoke test
-
-```bash
-LINKGATE_UPSTREAM=http://<your-upstream>:8090 ./scripts/smoke-test.sh
-```
-
-Uses separate ports (18765/18766) and does not touch your production config. Verifies automatic failover when the first route is dead, and correct pass-through of a 9 MB request body.
+- Generic TCP forwarding (SSH, database ports) — `protocol: tcp` is already reserved in the schema.
+- Prebuilt packages for macOS, Windows, and major Linux distributions.
+- HarmonyOS support (verification in progress).
 
 ## License
 
-<!-- TODO: confirm and add license -->
+[MIT](LICENSE)

@@ -22,12 +22,14 @@ import (
 	"sync"
 	"time"
 
+	"linkgate/internal/app"
+
 	"fyne.io/systray"
 	"gopkg.in/yaml.v3"
 )
 
 // version 可用 -ldflags "-X main.version=x.y.z" 覆盖；连上内核后以内核版本为准。
-var version = "0.1.0-dev"
+var version = app.Version
 
 //go:embed icons/tray-mac.png
 var iconMac []byte
@@ -36,10 +38,10 @@ var iconMac []byte
 var iconWin []byte
 
 const (
-	pollInterval = 2 * time.Second
-	maxGroupRows = 8 // 菜单项无法插入到中间，预留固定行数
-	panelW       = 1000
-	panelH       = 760
+	pollInterval        = 2 * time.Second
+	detailedServiceRows = 6 // Larger configurations use a summary and a complete submenu.
+	panelW              = 1000
+	panelH              = 760
 )
 
 // ---------- 管理 API 客户端 ----------
@@ -227,6 +229,19 @@ func groupSummary(g group) string {
 	return g.Name + " · " + g.Active
 }
 
+func servicesSummary(groups []group) string {
+	normal := 0
+	for _, g := range groups {
+		for _, u := range g.Upstreams {
+			if u.Name == g.Active && u.Enabled && u.Status == "healthy" {
+				normal++
+				break
+			}
+		}
+	}
+	return fmt.Sprintf("%d 个服务 · %d 正常", len(groups), normal)
+}
+
 func groupTooltip(g group) string {
 	parts := make([]string, 0, len(g.Upstreams))
 	for _, u := range g.Upstreams {
@@ -346,14 +361,16 @@ type tray struct {
 	connected bool
 	lastErr   string
 
-	mTitle  *systray.MenuItem
-	mInfo   *systray.MenuItem
-	mGroups []*systray.MenuItem
-	mRetry  *systray.MenuItem
-	mPanel  *systray.MenuItem
-	mReload *systray.MenuItem
-	mConfig *systray.MenuItem
-	mQuit   *systray.MenuItem
+	mTitle      *systray.MenuItem
+	mInfo       *systray.MenuItem
+	mGroups     []*systray.MenuItem
+	mServices   *systray.MenuItem
+	serviceRows map[string]*systray.MenuItem
+	mRetry      *systray.MenuItem
+	mPanel      *systray.MenuItem
+	mReload     *systray.MenuItem
+	mConfig     *systray.MenuItem
+	mQuit       *systray.MenuItem
 
 	refreshNow chan struct{}
 }
@@ -366,7 +383,8 @@ func newTray(s localSettings) *tray {
 			token: s.token,
 			http:  &http.Client{Timeout: 1500 * time.Millisecond},
 		},
-		refreshNow: make(chan struct{}, 1),
+		refreshNow:  make(chan struct{}, 1),
+		serviceRows: make(map[string]*systray.MenuItem),
 	}
 }
 
@@ -386,12 +404,14 @@ func (t *tray) onReady() {
 	t.mTitle.Disable()
 	t.mInfo = systray.AddMenuItem("未连接", "")
 	t.mInfo.Disable()
-	for i := 0; i < maxGroupRows; i++ {
+	for i := 0; i < detailedServiceRows; i++ {
 		m := systray.AddMenuItem("", "")
 		m.Disable()
 		m.Hide()
 		t.mGroups = append(t.mGroups, m)
 	}
+	t.mServices = systray.AddMenuItem("服务", "展开查看所有服务的当前线路")
+	t.mServices.Hide()
 	t.mRetry = systray.AddMenuItem("重试连接", "立即重新拉取内核状态")
 	systray.AddSeparator()
 	t.mPanel = systray.AddMenuItem("打开面板", "")
@@ -480,6 +500,7 @@ func (t *tray) refresh() {
 		for _, m := range t.mGroups {
 			m.Hide()
 		}
+		t.mServices.Hide()
 		t.mRetry.Show()
 		t.mPanel.Disable()
 		t.mReload.Disable()
@@ -502,20 +523,47 @@ func (t *tray) refresh() {
 	t.mPanel.Enable()
 	t.mReload.Enable()
 
-	tips := []string{"Linkgate " + ver}
-	for i, m := range t.mGroups {
-		if i < len(st.Groups) {
-			line := groupSummary(st.Groups[i])
-			m.SetTitle(line)
-			m.SetTooltip(groupTooltip(st.Groups[i]))
-			m.Show()
-			tips = append(tips, line)
-		} else {
+	tips := []string{"Linkgate " + ver, servicesSummary(st.Groups)}
+	seen := make(map[string]bool, len(st.Groups))
+	for _, g := range st.Groups {
+		line := groupSummary(g)
+		tips = append(tips, line)
+		seen[g.Name] = true
+		m := t.serviceRows[g.Name]
+		if m == nil {
+			m = t.mServices.AddSubMenuItem(line, groupTooltip(g))
+			m.Disable()
+			t.serviceRows[g.Name] = m
+		}
+		m.SetTitle(truncate(line, 72))
+		m.SetTooltip(groupTooltip(g))
+		m.Show()
+	}
+	for name, m := range t.serviceRows {
+		if !seen[name] {
 			m.Hide()
 		}
 	}
+	if len(st.Groups) > detailedServiceRows {
+		for _, m := range t.mGroups {
+			m.Hide()
+		}
+		t.mServices.SetTitle(servicesSummary(st.Groups))
+		t.mServices.Show()
+	} else {
+		t.mServices.Hide()
+		for i, m := range t.mGroups {
+			if i < len(st.Groups) {
+				m.SetTitle(truncate(groupSummary(st.Groups[i]), 72))
+				m.SetTooltip(groupTooltip(st.Groups[i]))
+				m.Show()
+			} else {
+				m.Hide()
+			}
+		}
+	}
 	if len(st.Groups) == 0 {
-		t.mGroups[0].SetTitle("没有线路组")
+		t.mGroups[0].SetTitle("暂无服务 · 在面板中添加")
 		t.mGroups[0].Show()
 	}
 	systray.SetTooltip(strings.Join(tips, "\n"))

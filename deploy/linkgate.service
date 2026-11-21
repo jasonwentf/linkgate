@@ -13,7 +13,8 @@ TimeoutStopSec=10
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/linkgate
+ReadWritePaths=/etc/linkgate /var/lib/linkgate
+Environment=HOME=/var/lib/linkgate
 
 [Install]
 WantedBy=multi-user.target

@@ -5,21 +5,18 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
-	"time"
 
 	"linkgate/internal/app"
 )
 
 var (
-	version = "0.1.0-dev"
+	version = app.Version
 	commit  = "dev"
 )
 
@@ -86,82 +83,20 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go monitor.Start(ctx)
-	defer monitor.Stop()
-
-	apply := func(next *app.Config) error {
-		if err := next.Validate(); err != nil {
-			return err
-		}
-		store.Load(next, thresholds(next), store)
-		if err := engine.Reload(next); err != nil {
-			return err
-		}
-		monitor.Update(next)
-		return nil
+	manager, err := app.NewConfigManager(*configPath, cfg, engine, store, monitor, events, logger)
+	if err != nil {
+		return err
 	}
-
-	admin := app.NewAdminServer(cfg, engine, store, events, apply, *configPath, logger)
+	admin := app.NewAdminServer(cfg, engine, store, events, *configPath, logger)
 	admin.SetProber(monitor)
 	admin.SetVersion(version)
-
-	// 组监听
-	type listener struct {
-		name string
-		srv  *http.Server
-		ln   net.Listener
+	manager.SetAdmin(admin)
+	if err := manager.Start(); err != nil {
+		return err
 	}
-	var listeners []listener
-	closeAll := func() {
-		for _, l := range listeners {
-			shutdownCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = l.srv.Shutdown(shutdownCtx)
-			c()
-			_ = l.ln.Close()
-		}
-	}
-	defer closeAll()
-
-	for _, g := range cfg.Groups {
-		ln, err := net.Listen("tcp", g.Listen)
-		if err != nil {
-			return fmt.Errorf("监听 %s (%s) 失败: %w", g.Name, g.Listen, err)
-		}
-		srv := &http.Server{
-			Handler:           engine.Handler(g.Name),
-			ReadHeaderTimeout: 30 * time.Second,
-			IdleTimeout:       120 * time.Second,
-			// 不设 WriteTimeout：流式响应可能持续数十分钟
-		}
-		listeners = append(listeners, listener{name: g.Name, srv: srv, ln: ln})
-		go func(name string, s *http.Server, l net.Listener) {
-			logger.Info("listening", "group", name, "addr", l.Addr().String())
-			if err := s.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("server stopped", "group", name, "err", err)
-			}
-		}(g.Name, srv, ln)
-		events.Add(app.Event{Level: "info", Kind: "start", Group: g.Name, Message: "线路组已启动，监听 " + g.Listen})
-	}
-
-	// 管理接口
-	if !cfg.Admin.Disabled {
-		ln, err := net.Listen("tcp", cfg.Admin.Listen)
-		if err != nil {
-			return fmt.Errorf("管理接口监听 %s 失败: %w", cfg.Admin.Listen, err)
-		}
-		adminSrv := &http.Server{
-			Handler:           admin.Handler(),
-			ReadHeaderTimeout: 15 * time.Second,
-			WriteTimeout:      30 * time.Second,
-		}
-		listeners = append(listeners, listener{name: "admin", srv: adminSrv, ln: ln})
-		go func() {
-			logger.Info("admin listening", "addr", ln.Addr().String())
-			if err := adminSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("admin server stopped", "err", err)
-			}
-		}()
-	}
+	defer manager.Close()
+	go monitor.Start(ctx)
+	defer monitor.Stop()
 
 	events.Add(app.Event{Level: "info", Kind: "start", Message: fmt.Sprintf("Linkgate %s 已启动", version)})
 	printBanner(cfg, *configPath)
@@ -175,15 +110,9 @@ func run() error {
 	for {
 		select {
 		case <-hup:
-			next, err := app.Load(*configPath)
-			if err != nil {
-				logger.Error("reload failed", "err", err)
-				events.Add(app.Event{Level: "error", Kind: "config", Message: "重载失败: " + err.Error()})
-				continue
-			}
-			if err := apply(next); err != nil {
-				logger.Error("reload failed", "err", err)
-				events.Add(app.Event{Level: "error", Kind: "config", Message: "重载失败: " + err.Error()})
+			if err := manager.Reload(); err != nil {
+				logger.Warn("reload rejected; previous configuration retained", "err", err)
+				events.Add(app.Event{Level: "warn", Kind: "config", Message: "重载失败，保留旧配置: " + err.Error()})
 				continue
 			}
 			logger.Info("config reloaded")
@@ -208,7 +137,7 @@ func runDoctor(cfg *app.Config, monitor *app.HealthMonitor) error {
 				failures++
 			}
 			if msg == "" {
-				msg = "HTTP 2xx/3xx"
+				msg = "探针成功"
 			}
 			fmt.Printf("  %-4s %-14s %7dms  %s\n", mark, u.Name, latency.Milliseconds(), msg)
 		}
@@ -225,7 +154,6 @@ func thresholds(cfg *app.Config) app.Thresholds {
 	return app.Thresholds{
 		FailThreshold:    cfg.Health.FailThreshold,
 		RecoverThreshold: cfg.Health.RecoverThreshold,
-		Cooldown:         cfg.Health.Cooldown.Duration,
 	}
 }
 
@@ -270,6 +198,7 @@ buffer:
   max_request_bytes: 134217728
   spill_threshold: 8388608
   max_concurrent: 64
+  global_max_concurrent: 64
 
 http:
   connect_timeout: 2s

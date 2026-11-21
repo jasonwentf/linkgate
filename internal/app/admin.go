@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -24,36 +23,40 @@ import (
 // 安全边界：只应监听回环地址；所有 /v1 接口都要求 X-Linkgate-Token，
 // 写接口额外校验 Origin，避免浏览器里的恶意页面越权改配置。
 type AdminServer struct {
-	mu        sync.RWMutex
-	cfg       *Config
-	engine    *Engine
-	store     *Store
-	events    *EventLog
-	apply     func(*Config) error
-	cfgPath   string
-	log       *slog.Logger
-	token     string
-	startedAt time.Time
-	version   string
-	prober    Prober
+	mu             sync.RWMutex
+	cfg            *Config
+	saved          *Config
+	pendingRestart []string
+	engine         *Engine
+	store          *Store
+	events         *EventLog
+	manager        *ConfigManager
+	gate           *sync.RWMutex
+	cfgPath        string
+	log            *slog.Logger
+	token          string
+	startedAt      time.Time
+	version        string
+	prober         Prober
 }
 
 // Prober 是即时探测能力（由 HealthMonitor 实现）。
 type Prober interface {
-	ProbeNow(group, name string) (bool, time.Duration, string)
+	ProbeNowResult(group, name string) ProbeResult
 }
 
 func NewAdminServer(cfg *Config, engine *Engine, store *Store, events *EventLog,
-	apply func(*Config) error, cfgPath string, logger *slog.Logger) *AdminServer {
+	cfgPath string, logger *slog.Logger) *AdminServer {
 	a := &AdminServer{
 		cfg:       cfg,
+		saved:     cfg,
 		engine:    engine,
 		store:     store,
 		events:    events,
-		apply:     apply,
+		gate:      &sync.RWMutex{},
 		cfgPath:   cfgPath,
 		log:       logger,
-		startedAt: time.Now(),
+		startedAt: time.Now().Round(0),
 		version:   Version,
 	}
 	a.token = loadOrCreateToken(cfg)
@@ -98,12 +101,24 @@ func (a *AdminServer) Update(cfg *Config) {
 	a.mu.Unlock()
 }
 
+func (a *AdminServer) updateSaved(saved *Config, pending []string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.saved = saved
+	a.pendingRestart = append([]string{}, pending...)
+}
+
 func (a *AdminServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/__linkgate/v1/health", a.handleHealth)
 	mux.HandleFunc("/__linkgate/v1/status", a.auth(a.handleStatus))
 	mux.HandleFunc("/__linkgate/v1/events", a.auth(a.handleEvents))
+	mux.HandleFunc("/__linkgate/v1/settings", a.auth(a.handleSettings))
+	mux.HandleFunc("/__linkgate/v1/stats", a.auth(a.handleStats))
+	mux.HandleFunc("/__linkgate/v1/ui/order", a.auth(a.handleUIOrder))
 	mux.HandleFunc("/__linkgate/v1/config", a.auth(a.handleConfig))
+	mux.HandleFunc("/__linkgate/v1/groups", a.auth(a.handleGroups))
+	mux.HandleFunc("/__linkgate/v1/groups/", a.auth(a.handleGroupUpstreams))
 	mux.HandleFunc("/__linkgate/v1/probe", a.auth(a.handleProbe))
 	mux.HandleFunc("/__linkgate/v1/toggle", a.auth(a.handleToggle))
 	mux.HandleFunc("/__linkgate/v1/reload", a.auth(a.handleReload))
@@ -188,10 +203,13 @@ func splitHostPort(addr string) (string, string, error) {
 }
 
 func (a *AdminServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	a.mu.RLock()
+	ver := a.version
+	a.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
-		"version": a.version,
-		"uptime":  int64(time.Since(a.startedAt).Seconds()),
+		"version": ver,
+		"uptime":  a.uptimeSeconds(),
 	})
 }
 
@@ -200,67 +218,77 @@ func (a *AdminServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "只支持 GET"})
 		return
 	}
+	a.gate.RLock()
+	defer a.gate.RUnlock()
 	a.mu.RLock()
 	cfg := a.cfg
 	ver := a.version
+	pending := append([]string{}, a.pendingRestart...)
 	a.mu.RUnlock()
 
 	type status struct {
-		Version   string       `json:"version"`
-		StartedAt time.Time    `json:"started_at"`
-		UptimeSec int64        `json:"uptime_seconds"`
-		Config    string       `json:"config_path"`
-		Groups    []GroupState `json:"groups"`
-		LastSeq   uint64       `json:"last_seq"`
+		Version        string       `json:"version"`
+		StartedAt      time.Time    `json:"started_at"`
+		UptimeSec      int64        `json:"uptime_seconds"`
+		Config         string       `json:"config_path"`
+		Groups         []GroupState `json:"groups"`
+		LastSeq        uint64       `json:"last_seq"`
+		UI             UIConfig     `json:"ui"`
+		PendingRestart []string     `json:"pending_restart"`
 	}
+	groups := a.store.Snapshot(cfg)
+	sortServiceStates(groups, cfg.UI)
 	writeJSON(w, http.StatusOK, status{
-		Version:   ver,
-		StartedAt: a.startedAt,
-		UptimeSec: int64(time.Since(a.startedAt).Seconds()),
-		Config:    a.cfgPath,
-		Groups:    a.store.Snapshot(cfg),
-		LastSeq:   a.events.LastSeq(),
+		Version:        ver,
+		StartedAt:      a.startedAt,
+		UptimeSec:      a.uptimeSeconds(),
+		Config:         a.cfgPath,
+		Groups:         groups,
+		UI:             cfg.UI,
+		PendingRestart: pending,
+		LastSeq:        a.events.LastSeq(),
 	})
 }
 
 func (a *AdminServer) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]any{"error": "只支持 GET"})
+		return
+	}
 	after := parseUint(r.URL.Query().Get("after"))
 	limit := int(parseUint(r.URL.Query().Get("limit")))
-	if limit <= 0 {
-		limit = 200
+	stream := r.URL.Query().Get("stream")
+	if stream != "" && stream != "state" && stream != "request" {
+		writeJSON(w, 400, map[string]any{"error": "stream 只支持 state/request"})
+		return
 	}
-	var evs []Event
-	if after > 0 {
-		evs = a.events.Since(after, limit)
-	} else {
-		evs = a.events.Recent(limit)
-	}
-	last := a.events.LastSeq()
+	evs, last := a.events.QueryStream(r.URL.Query().Get("group"), stream, r.URL.Query().Get("kind"), after, limit)
 	writeJSON(w, http.StatusOK, map[string]any{"events": evs, "last_seq": last})
 }
 
 func (a *AdminServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		a.gate.RLock()
+		defer a.gate.RUnlock()
 		b, err := os.ReadFile(ExpandPath(a.cfgPath))
 		if err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{"path": a.cfgPath, "yaml": "", "error": err.Error()})
+			writeJSON(w, http.StatusOK, map[string]any{"path": a.cfgPath, "yaml": "", "error": redactURLText(err.Error())})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"path": a.cfgPath, "yaml": string(b)})
+		// Forms use the accepted structured configuration; YAML remains the disk view.
+		a.mu.RLock()
+		groups := a.cfg.Groups
+		a.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{"path": a.cfgPath, "yaml": string(b), "groups": groups})
 	case http.MethodPut, http.MethodPost:
-		body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+		body, err := readConfigBody(r)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			writeJSON(w, apiErrorStatus(err), map[string]any{"error": redactURLText(err.Error())})
 			return
 		}
-		next, err := Parse(body)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		if err := a.saveAndApply(body, next); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		if err := a.manager.Save(body); err != nil {
+			writeJSON(w, apiErrorStatus(err), map[string]any{"error": redactURLText(err.Error())})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -269,23 +297,12 @@ func (a *AdminServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (a *AdminServer) saveAndApply(raw []byte, next *Config) error {
-	path := ExpandPath(a.cfgPath)
-	if old, err := os.ReadFile(path); err == nil {
-		_ = os.WriteFile(path+".bak", old, 0o600)
+func (a *AdminServer) uptimeSeconds() int64 {
+	n := int64(time.Now().Round(0).Sub(a.startedAt).Seconds())
+	if n < 0 {
+		return 0
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return err
-	}
-	if err := a.apply(next); err != nil {
-		return fmt.Errorf("配置已写入但热加载失败: %w", err)
-	}
-	a.Update(next)
-	a.events.Add(Event{Level: "info", Kind: "config", Message: "面板保存并热加载了配置"})
-	return nil
+	return n
 }
 
 func (a *AdminServer) handleProbe(w http.ResponseWriter, r *http.Request) {
@@ -302,10 +319,16 @@ func (a *AdminServer) handleProbe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "探针未就绪"})
 		return
 	}
-	ok, latency, msg := p.ProbeNow(group, name)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": ok, "latency_ms": latency.Milliseconds(), "error": msg,
-	})
+	a.gate.RLock()
+	exists := a.exists(group, name)
+	a.gate.RUnlock()
+	if !exists {
+		writeJSON(w, 404, map[string]any{"error": "没有这条线路"})
+		return
+	}
+	result := p.ProbeNowResult(group, name)
+	result.Error = redactURLText(result.Error)
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (a *AdminServer) handleToggle(w http.ResponseWriter, r *http.Request) {
@@ -315,6 +338,8 @@ func (a *AdminServer) handleToggle(w http.ResponseWriter, r *http.Request) {
 	}
 	group := r.URL.Query().Get("group")
 	name := r.URL.Query().Get("upstream")
+	a.gate.RLock()
+	defer a.gate.RUnlock()
 	if !a.exists(group, name) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "没有这条线路：" + group + "/" + name})
 		return
@@ -351,16 +376,10 @@ func (a *AdminServer) handleReload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "只支持 POST"})
 		return
 	}
-	next, err := Load(a.cfgPath)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+	if err := a.manager.Reload(); err != nil {
+		writeJSON(w, apiErrorStatus(err), map[string]any{"error": redactURLText(err.Error())})
 		return
 	}
-	if err := a.apply(next); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-	a.Update(next)
 	a.events.Add(Event{Level: "info", Kind: "config", Message: "重新读取配置文件并应用"})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

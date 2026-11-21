@@ -1,8 +1,8 @@
 # 在 Windows 上安装 Linkgate（内核 + 托盘）。
 # 用法（PowerShell，普通用户即可，不需要管理员）：
-#   .\install.ps1 -SourceDir .\dist -Config "$env:USERPROFILE\.linkgate\config.yaml"
+#   .\install.ps1 -SourceDir .\bin\dist -Config "$env:USERPROFILE\.linkgate\config.yaml"
 param(
-    [string]$SourceDir = "$PSScriptRoot",
+    [string]$SourceDir = "$PSScriptRoot\..\..\bin\dist",
     [string]$Config = "$env:USERPROFILE\.linkgate\config.yaml"
 )
 
@@ -11,8 +11,8 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path $Config) | Out-Null
 
 Copy-Item "$SourceDir\linkgate-windows-amd64.exe" "$InstallDir\linkgate.exe" -Force
-if (Test-Path "$SourceDir\linkgate-tray.exe") {
-    Copy-Item "$SourceDir\linkgate-tray.exe" "$InstallDir\linkgate-tray.exe" -Force
+if (Test-Path "$SourceDir\linkgate-tray-windows-amd64.exe") {
+    Copy-Item "$SourceDir\linkgate-tray-windows-amd64.exe" "$InstallDir\linkgate-tray.exe" -Force
 }
 
 if (-not (Test-Path $Config)) {

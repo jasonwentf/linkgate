@@ -35,7 +35,6 @@ func testEngine(t *testing.T, cfg *Config) (*Engine, *Store, *EventLog) {
 	}
 	store := NewStore(cfg, Thresholds{
 		FailThreshold: cfg.Health.FailThreshold, RecoverThreshold: cfg.Health.RecoverThreshold,
-		Cooldown: cfg.Health.Cooldown.Duration,
 	})
 	events := NewEventLog(100)
 	engine, err := NewEngine(cfg, store, events, testLogger())
@@ -81,8 +80,8 @@ func TestEngineDialFailureFailsOver(t *testing.T) {
 	closed.Close()
 
 	cfg := testConfig(
-		UpstreamConfig{Name: "primary", URL: closed.URL, Priority: 10},
-		UpstreamConfig{Name: "backup", URL: backup.URL, Priority: 20},
+		UpstreamConfig{Name: "primary", URL: closed.URL, Priority: intPtr(10)},
+		UpstreamConfig{Name: "backup", URL: backup.URL, Priority: intPtr(20)},
 	)
 	engine, store, events := testEngine(t, cfg)
 	recorder := httptest.NewRecorder()
@@ -132,8 +131,8 @@ func TestEngineResponseHeaderTimeoutDoesNotRetry(t *testing.T) {
 	}))
 	defer backup.Close()
 	cfg := testConfig(
-		UpstreamConfig{Name: "primary", URL: primary.URL, Priority: 10},
-		UpstreamConfig{Name: "backup", URL: backup.URL, Priority: 20},
+		UpstreamConfig{Name: "primary", URL: primary.URL, Priority: intPtr(10)},
+		UpstreamConfig{Name: "backup", URL: backup.URL, Priority: intPtr(20)},
 	)
 	cfg.HTTP.ResponseHeaderTimeout = Duration{200 * time.Millisecond}
 	engine, store, events := testEngine(t, cfg)
@@ -424,7 +423,7 @@ func TestEngine5xxDoesNotFailOverOrMarkUnhealthy(t *testing.T) {
 	defer primary.Close()
 	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { backupHits.Add(1) }))
 	defer backup.Close()
-	cfg := testConfig(UpstreamConfig{Name: "primary", URL: primary.URL, Priority: 10}, UpstreamConfig{Name: "backup", URL: backup.URL, Priority: 20})
+	cfg := testConfig(UpstreamConfig{Name: "primary", URL: primary.URL, Priority: intPtr(10)}, UpstreamConfig{Name: "backup", URL: backup.URL, Priority: intPtr(20)})
 	engine, store, events := testEngine(t, cfg)
 	for i := 0; i < cfg.Health.FailThreshold+1; i++ {
 		recorder := httptest.NewRecorder()
@@ -457,10 +456,10 @@ func TestEngineUnhealthyPrimarySelectsBackup(t *testing.T) {
 	defer primary.Close()
 	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "backup") }))
 	defer backup.Close()
-	cfg := testConfig(UpstreamConfig{Name: "primary", URL: primary.URL, Priority: 10}, UpstreamConfig{Name: "backup", URL: backup.URL, Priority: 20})
+	cfg := testConfig(UpstreamConfig{Name: "primary", URL: primary.URL, Priority: intPtr(10)}, UpstreamConfig{Name: "backup", URL: backup.URL, Priority: intPtr(20)})
 	engine, store, _ := testEngine(t, cfg)
 	for i := 0; i < cfg.Health.FailThreshold; i++ {
-		store.RecordFailure("test", "primary", "dial failed", 0)
+		store.RecordFailure(store.Config(), "test", "primary", "dial failed", 0)
 	}
 	recorder := httptest.NewRecorder()
 	engine.Handler("test").ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -490,9 +489,9 @@ func TestEngineNoFailoverWhenNoFurtherAttempt(t *testing.T) {
 		{name: "attempt limit", mode: "connect", maxAttempts: 1, withBackup: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := testConfig(UpstreamConfig{Name: "primary", URL: closed.URL, Priority: 10})
+			cfg := testConfig(UpstreamConfig{Name: "primary", URL: closed.URL, Priority: intPtr(10)})
 			if tc.withBackup {
-				cfg.Groups[0].Upstreams = append(cfg.Groups[0].Upstreams, UpstreamConfig{Name: "backup", URL: backup.URL, Priority: 20})
+				cfg.Groups[0].Upstreams = append(cfg.Groups[0].Upstreams, UpstreamConfig{Name: "backup", URL: backup.URL, Priority: intPtr(20)})
 			}
 			cfg.Retry.Mode = tc.mode
 			cfg.Retry.MaxAttempts = tc.maxAttempts

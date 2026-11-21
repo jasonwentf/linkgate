@@ -160,14 +160,19 @@ func (b *bufferedBody) Close() {
 }
 
 // groupRuntime 是一个监听端口对应的线路集合。
+// 每个实例只属于一 submit 的配置代际：g.cfg 指向这一代的 *Config，
+// 请求一旦绑定到 g，就全程使用这一代的配置与线路，不再中途回查 engine。
 type groupRuntime struct {
+	cfg         *Config     // 本运行时所属的配置代际
+	state       *stateTable // 本代运行时状态视图；换代后成为不可变快照
 	name        string
 	listen      string
 	stripPrefix string
 	addHeaders  map[string]string
 	httpCfg     HTTPConfig
 	upstreams   []*upstreamRuntimeCfg // 已按优先级排序
-	sem         chan struct{}
+	uaRules     []uaRuleRuntime       // 本代编译后的规则，按配置顺序
+	sem         *concurrencyLimit
 }
 
 type upstreamRuntimeCfg struct {
@@ -181,17 +186,19 @@ type upstreamRuntimeCfg struct {
 
 // Engine 是代理内核。无 cgo、无平台依赖。
 type Engine struct {
-	mu     sync.RWMutex
-	cfg    *Config
-	store  *Store
-	events *EventLog
-	log    *slog.Logger
-	groups map[string]*groupRuntime
-	closed bool
+	mu          sync.RWMutex
+	cfg         *Config
+	store       *Store
+	events      *EventLog
+	log         *slog.Logger
+	groups      map[string]*groupRuntime
+	gate        *sync.RWMutex
+	global      *concurrencyLimit
+	groupLimits map[string]*concurrencyLimit
 }
 
 func NewEngine(cfg *Config, store *Store, events *EventLog, logger *slog.Logger) (*Engine, error) {
-	e := &Engine{store: store, events: events, log: logger}
+	e := &Engine{store: store, events: events, log: logger, gate: &sync.RWMutex{}, global: newConcurrencyLimit(cfg.Buffer.GlobalMaxConcurrent), groupLimits: make(map[string]*concurrencyLimit)}
 	if err := e.rebuild(cfg); err != nil {
 		return nil, err
 	}
@@ -204,19 +211,43 @@ func (e *Engine) rebuild(cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	e.commitGroups(cfg, groups)
+	return nil
+}
+
+func (e *Engine) commitGroups(cfg *Config, groups map[string]*groupRuntime) {
 	e.mu.Lock()
 	old := e.groups
+	for name, g := range groups {
+		// 把本代状态表引用挂到运行时上。之后请求只读这份引用：
+		// 提交不会改旧表，连续多少次提交都不影响已 dispatch 的请求。
+		g.state = e.store.View(cfg)
+		limit := e.groupLimits[name]
+		if limit == nil {
+			limit = newConcurrencyLimit(cfg.Buffer.MaxConcurrent)
+			e.groupLimits[name] = limit
+		}
+		limit.resize(cfg.Buffer.MaxConcurrent)
+		g.sem = limit
+	}
+	for name := range e.groupLimits {
+		if groups[name] == nil {
+			delete(e.groupLimits, name)
+		}
+	}
+	e.global.resize(cfg.Buffer.GlobalMaxConcurrent)
 	e.cfg = cfg
 	e.groups = groups
 	e.mu.Unlock()
-	if old != nil {
-		for _, g := range old {
-			for _, u := range g.upstreams {
-				u.transport.CloseIdleConnections()
-			}
+	closeGroupTransports(old)
+}
+
+func closeGroupTransports(groups map[string]*groupRuntime) {
+	for _, g := range groups {
+		for _, u := range g.upstreams {
+			u.transport.CloseIdleConnections()
 		}
 	}
-	return nil
 }
 
 func buildGroups(cfg *Config) (map[string]*groupRuntime, error) {
@@ -224,12 +255,20 @@ func buildGroups(cfg *Config) (map[string]*groupRuntime, error) {
 	for gi := range cfg.Groups {
 		g := &cfg.Groups[gi]
 		gr := &groupRuntime{
+			cfg:         cfg,
 			name:        g.Name,
 			listen:      g.Listen,
 			stripPrefix: strings.TrimSuffix(g.StripPrefix, "/"),
 			addHeaders:  g.AddHeaders,
 			httpCfg:     cfg.EffectiveHTTP(g),
-			sem:         make(chan struct{}, cfg.Buffer.MaxConcurrent),
+			sem:         newConcurrencyLimit(cfg.Buffer.MaxConcurrent),
+		}
+		for i, rule := range g.UARules {
+			matcher, err := compileUAMatch(rule.Match)
+			if err != nil {
+				return nil, fmt.Errorf("group %q.ua_rules[%d]: %w", g.Name, i, err)
+			}
+			gr.uaRules = append(gr.uaRules, uaRuleRuntime{matcher: matcher, line: rule.Line})
 		}
 		// 按优先级排序（同优先级保持书写顺序）
 		ordered := make([]UpstreamConfig, len(g.Upstreams))
@@ -261,7 +300,7 @@ func buildGroups(cfg *Config) (map[string]*groupRuntime, error) {
 				IdleConnTimeout:       gr.httpCfg.IdleConnTimeout.Or(90 * time.Second),
 				MaxIdleConns:          128,
 				MaxIdleConnsPerHost:   gr.httpCfg.MaxIdleConnsPerHost,
-				DisableCompression:    true,
+				DisableCompression:    compressionDisabled(gr.httpCfg),
 				ForceAttemptHTTP2:     true,
 			}
 			gr.upstreams = append(gr.upstreams, &upstreamRuntimeCfg{
@@ -278,7 +317,7 @@ func buildGroups(cfg *Config) (map[string]*groupRuntime, error) {
 
 func stableSortByPriority(us []UpstreamConfig) {
 	for i := 1; i < len(us); i++ {
-		for j := i; j > 0 && us[j].Priority < us[j-1].Priority; j-- {
+		for j := i; j > 0 && us[j].PriorityValue() < us[j-1].PriorityValue(); j-- {
 			us[j], us[j-1] = us[j-1], us[j]
 		}
 	}
@@ -325,27 +364,11 @@ func (e *Engine) Groups() map[string]string {
 	return out
 }
 
-// Handler 返回某个组的 HTTP 处理器。
+// Handler 按组名解析当前这一代的 groupRuntime 并返回处理器。
+// 只在启动装配或测试入口使用；监听器必须使用 handlerFor 绑定具体代际，
+// 否则“先取 dispatch、后按组名回查”会在换组名/互换地址时串组。
 func (e *Engine) Handler(group string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/__linkgate") {
-			http.Error(w, "reserved path", http.StatusNotFound)
-			return
-		}
-		e.serveGroup(w, r, group)
-	})
-}
-
-// Close 关闭所有空闲连接。
-func (e *Engine) Close() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.closed = true
-	for _, g := range e.groups {
-		for _, u := range g.upstreams {
-			u.transport.CloseIdleConnections()
-		}
-	}
+	return e.handlerFor(e.group(group))
 }
 
 func (e *Engine) group(name string) *groupRuntime {
@@ -354,31 +377,84 @@ func (e *Engine) group(name string) *groupRuntime {
 	return e.groups[name]
 }
 
-type attemptResult struct {
-	err       error
-	resp      *http.Response
-	upstream  string
-	connectMS int64
-	headerMS  int64
-	attempted int
+// snapshotGroups 复制当前组映射（只读用途，启动时装配监听器）。
+func (e *Engine) snapshotGroups() map[string]*groupRuntime {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make(map[string]*groupRuntime, len(e.groups))
+	for name, g := range e.groups {
+		out[name] = g
+	}
+	return out
 }
 
-func (e *Engine) serveGroup(w http.ResponseWriter, r *http.Request, groupName string) {
-	g := e.group(groupName)
+// handlerFor 把处理器直接绑定到某一代 groupRuntime。
+// 请求进入后不再按组名回查 engine：组被改名、删除或两个组互换监听地址时，
+// 旧 dispatch 仍只会服务它自己绑定过的那一代对象。
+func (e *Engine) handlerFor(g *groupRuntime) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/__linkgate") {
+			http.Error(w, "reserved path", http.StatusNotFound)
+			return
+		}
+		if g == nil {
+			http.Error(w, "unknown group", http.StatusServiceUnavailable)
+			return
+		}
+		e.serveGroup(w, r, g)
+	})
+}
+
+// Close 关闭所有空闲连接。
+func (e *Engine) Close() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, g := range e.groups {
+		for _, u := range g.upstreams {
+			u.transport.CloseIdleConnections()
+		}
+	}
+}
+
+// serveGroup 只处理已经绑定到某一代 g 的请求。
+//
+// 请求入口处一次性取定：g（含组配置与线路列表）、g.cfg（这一代的全局配置）。
+// 之后读请求体、选路、发请求、写健康状态都用这份快照，不再按组名回查 engine，
+// 也不因为缓冲期间配置换代而改用新线路集——否则旧请求会拿到空候选或把失败
+// 记到新线路上。
+func (e *Engine) serveGroup(w http.ResponseWriter, r *http.Request, g *groupRuntime) {
 	if g == nil {
 		http.Error(w, "unknown group", http.StatusServiceUnavailable)
 		return
 	}
-	cfg := e.Config()
+	cfg := g.cfg
+	groupName := g.name
+	// 入站时冻结每条线路的运行时可用性。配置在缓冲期间换代后，选路只能回退到
+	// “入站当时就是可用”的线路——不能复活已停用或当时已判死的线路。
+	frozen := e.freezeLines(g)
+	// UA 规则与线路同属 g 的代际；入站即冻结命中结果，不在缓冲后读新规则。
+	pinned := g.pinnedLine(r.UserAgent())
 	start := time.Now()
+	e.store.RecordRequestStart(cfg, groupName, start)
+	var completedOK, usedBackup bool
+	var completedLine string
+	defer func() {
+		if r.Context().Err() != nil {
+			e.store.RecordRequestCanceled(cfg, groupName)
+			return
+		}
+		e.store.RecordRequestEnd(cfg, groupName, r.UserAgent(), completedLine, completedOK, usedBackup)
+	}()
 
-	// 并发缓冲限制
-	select {
-	case g.sem <- struct{}{}:
-		defer func() { <-g.sem }()
-	case <-r.Context().Done():
+	// Limits cover buffering and forwarding; reload does not reset active slots.
+	if !g.sem.acquire(r.Context()) {
 		return
 	}
+	defer g.sem.release()
+	if !e.global.acquire(r.Context()) {
+		return
+	}
+	defer e.global.release()
 
 	// 客户端发完请求头就停住不传时，Read 会一直阻塞；给整段读取一个期限。
 	rcIn := http.NewResponseController(w)
@@ -396,7 +472,7 @@ func (e *Engine) serveGroup(w http.ResponseWriter, r *http.Request, groupName st
 	}
 	defer body.Close()
 
-	order := e.candidates(g, body.size)
+	order := e.candidates(g, frozen, body.size, pinned)
 	if len(order) == 0 {
 		http.Error(w, "no upstream configured", http.StatusServiceUnavailable)
 		return
@@ -416,6 +492,9 @@ func (e *Engine) serveGroup(w http.ResponseWriter, r *http.Request, groupName st
 			break
 		}
 	}
+	if pinned != "" {
+		primaryName = pinned
+	}
 	var (
 		lastErr  error
 		lastName string
@@ -423,44 +502,52 @@ func (e *Engine) serveGroup(w http.ResponseWriter, r *http.Request, groupName st
 	for i := 0; i < maxAttempts; i++ {
 		up := order[i]
 		name := up.cfg.Name
+		usedBackup = usedBackup || i > 0 || name != primaryName
 		attemptStart := time.Now()
 		resp, err, at := e.doAttempt(r, g, up, body)
 		if err == nil {
+			completedLine = name
 			// 注意：不能在这里关闭缓冲副本。收到响应头不代表上传已经结束
 			// （HTTP/2 双向流、服务端提前响应都会继续读请求体），提前关文件会
 			// 把还在上传的请求截断。统一由 defer body.Close() 在流结束后释放。
-			e.store.RecordSelected(groupName, name, i > 0 || name != primaryName)
-			e.stream(w, r, resp, g, up, name, time.Since(attemptStart), start)
+			e.store.RecordSelected(cfg, groupName, name, i > 0 || name != primaryName)
+			completedOK = e.stream(w, r, resp, g, up, name, time.Since(attemptStart), start)
+			return
+		}
+
+		if r.Context().Err() != nil {
+			e.log.Debug("client canceled before response headers", "group", groupName, "upstream", name, "err", errString(err))
+			e.events.Add(Event{Level: "debug", Kind: "request", Group: groupName, Upstream: name, Message: "客户端主动取消请求"})
 			return
 		}
 
 		// 只有“请求头一个字节都没写出去”才允许换线路：此时上游不可能收到请求，
 		// 重发不会重复计费。判断依据来自 httptrace，不看错误类型或错误字符串。
 		if !at.failoverSafe() {
-			e.store.RecordFailure(groupName, name, at.reason(err), time.Since(start))
+			e.store.RecordFailure(cfg, groupName, name, at.reason(err), time.Since(start))
 			e.events.Add(Event{
 				Level: "error", Kind: "request", Group: groupName, Upstream: name,
 				DurationMS: time.Since(start).Milliseconds(),
 				Message:    at.reason(err),
 			})
-			e.log.Error("upstream request failed", "group", groupName, "upstream", name, "reason", at.reason(err), "err", err)
+			e.log.Error("upstream request failed", "group", groupName, "upstream", name, "reason", at.reason(err), "err", errString(err))
 			writeProxyError(w, groupName, name, err)
 			return
 		}
 
 		lastErr, lastName = err, name
-		e.store.RecordFailure(groupName, name, at.reason(err), time.Since(start))
+		e.store.RecordFailure(cfg, groupName, name, at.reason(err), time.Since(start))
 		if i+1 >= maxAttempts {
 			break
 		}
-		e.store.RecordFailover(groupName, name)
+		e.store.RecordFailover(cfg, groupName, name)
 		next := order[i+1].cfg.Name
 		e.events.Add(Event{
 			Level: "warn", Kind: "failover", Group: groupName, Upstream: name, From: name, To: next,
 			DurationMS: time.Since(attemptStart).Milliseconds(),
 			Message:    "连接未建立，切换线路: " + shorten(errString(err), 200),
 		})
-		e.log.Warn("failover", "group", groupName, "from", name, "to", next, "err", err)
+		e.log.Warn("failover", "group", groupName, "from", name, "to", next, "err", errString(err))
 		if cfg.Retry.Backoff.Duration > 0 && i+1 < maxAttempts {
 			select {
 			case <-time.After(cfg.Retry.Backoff.Duration):
@@ -482,28 +569,99 @@ func errString(err error) string {
 	if err == nil {
 		return "unknown"
 	}
-	return err.Error()
+	// 错误文案可能带完整上游 URL（含 userinfo/query），对外与落日志前统一脱敏。
+	return redactURLText(err.Error())
+}
+
+// lineSnapshot 是请求入站时一条线路的运行时可用性快照。
+type lineSnapshot struct {
+	enabled bool
+	usable  bool // 运行时启用且健康状态不是 unhealthy
+}
+
+// freezeLines 在请求入口冻结每条线路的可用性。数据源是 g.state：
+// 请求自己持有那一代的状态表，不按代际回查 Store、也不依赖任何“保留几代”
+// 的缓存，因此连续多次提交不会让在飞请求丢失自己那代的停用/健康信息。
+func (e *Engine) freezeLines(g *groupRuntime) map[string]lineSnapshot {
+	out := make(map[string]lineSnapshot, len(g.upstreams))
+	for _, u := range g.upstreams {
+		enabled, usable := e.lineAvailability(g, u)
+		out[u.cfg.Name] = lineSnapshot{enabled: enabled, usable: usable}
+	}
+	return out
+}
+
+// lineAvailability 从 groupRuntime 自带的状态表引用读取线路可用性。
+// 引用生命周期随 groupRuntime（及其 handler / 在飞请求），与 Store 已经提交
+// 了几代无关：换代表在提交后停止写入，读到的就是请求那一代的最终状态；
+// 仍是当前代时读到的是实时状态（健康变化、运行时开关）。
+func (e *Engine) lineAvailability(g *groupRuntime, u *upstreamRuntimeCfg) (enabled, usable bool) {
+	enabled = u.cfg.IsEnabled()
+	usable = enabled
+	if rtEnabled, status, ok := e.store.LineState(g.state, g.name, u.cfg.Name); ok {
+		enabled = rtEnabled
+		usable = rtEnabled && status != StatusUnhealthy
+	}
+	return enabled, usable
 }
 
 // candidates 返回按优先级排序的线路：先可用线路，再接上不可用线路作为兜底。
-// 运行时被停用的线路、以及请求体超过其 max_body_bytes 的线路直接排除。
-func (e *Engine) candidates(g *groupRuntime, bodySize int64) []*upstreamRuntimeCfg {
+// 请求体超过线路 max_body_bytes 的候选始终排除。
+//
+// 选路只看这一代 g 的线路列表，按是否仍是当前代分成两种语义：
+//   - live=true：读实时状态（配置 enabled + 运行时开关 + 健康），未判死的
+//     线路优先；已判死的线路保留在兜底尾巴里。
+//   - live=false（请求缓冲/执行期间配置已换代）：**只用入站冻结快照**——
+//     入站时 enabled 且 usable 的线路才入选，完全不经过旧状态表的 enabled
+//     过滤。这样“先可用、后被停用/判死”的线路不会被旧表二次判死，也不会
+//     复活入站时就不可用的线路。
+//
+// UA pinning 只排序已有候选：目标排最前，其余保持原健康/优先级顺序；
+// 不绕过停用、体积或代际资格过滤，也不改变 failoverSafe 的换线许可。
+func (e *Engine) candidates(g *groupRuntime, frozen map[string]lineSnapshot, bodySize int64, pinned string) []*upstreamRuntimeCfg {
 	healthy := make([]*upstreamRuntimeCfg, 0, len(g.upstreams))
 	unhealthy := make([]*upstreamRuntimeCfg, 0, len(g.upstreams))
+	// 本代仍是当前代时，健康/运行时开关可以继续变化，按实时值选路；
+	// 一旦换代，本代状态表已冻结，只认请求入站时冻结的可用线路。
+	live := e.store.Config() == g.cfg
 	for _, u := range g.upstreams {
-		if !u.cfg.IsEnabled() || !e.store.Enabled(g.name, u.cfg.Name) {
+		if !live {
+			// 换代后纯用入站快照，不再经过旧状态表/旧配置的 enabled 过滤。
+			snap, ok := frozen[u.cfg.Name]
+			if !ok || !snap.enabled || !snap.usable {
+				continue
+			}
+			if u.cfg.MaxBodyBytes > 0 && bodySize > u.cfg.MaxBodyBytes {
+				continue
+			}
+			healthy = append(healthy, u)
+			continue
+		}
+		if !u.cfg.IsEnabled() {
+			continue
+		}
+		enabled, usable := e.lineAvailability(g, u)
+		if !enabled {
 			continue
 		}
 		if u.cfg.MaxBodyBytes > 0 && bodySize > u.cfg.MaxBodyBytes {
 			continue
 		}
-		if e.store.IsUsable(g.name, u.cfg.Name) {
+		if usable {
 			healthy = append(healthy, u)
 		} else {
 			unhealthy = append(unhealthy, u)
 		}
 	}
-	return append(healthy, unhealthy...)
+	order := append(healthy, unhealthy...)
+	for i, u := range order {
+		if u.cfg.Name == pinned {
+			copy(order[1:i+1], order[:i])
+			order[0] = u
+			break
+		}
+	}
+	return order
 }
 
 // attemptTrace 精确回答“这次尝试到底有没有把请求发出去”。
@@ -646,7 +804,21 @@ func (e *Engine) doAttempt(orig *http.Request, g *groupRuntime, up *upstreamRunt
 			up.transport.CloseIdleConnections()
 		}
 	}
+	var warnTimer *time.Timer
+	if warn := g.httpCfg.ResponseHeaderWarnAfter.Duration; warn > 0 {
+		warnTimer = time.AfterFunc(warn, func() {
+			if orig.Context().Err() != nil {
+				return
+			}
+			e.log.Warn("waiting for response headers", "group", g.name, "upstream", up.cfg.Name, "after", warn)
+			e.events.Add(Event{Level: "warn", Kind: "request", Group: g.name, Upstream: up.cfg.Name,
+				Message: fmt.Sprintf("超过 %s 仍未收到响应头（仅预警，不重发）", warn)})
+		})
+	}
 	resp, err := up.transport.RoundTrip(req)
+	if warnTimer != nil {
+		warnTimer.Stop()
+	}
 	if err != nil {
 		guard.Stop()
 		guard.Close()
@@ -740,7 +912,7 @@ func (g *uploadGuard) Close() error {
 //   - 空闲超时：上游卡死，主动打断；
 //   - 其他读错误（含 chunked 缺少终止块）：响应被截断，必须让客户端也能看出来，
 //     不能悄悄补一个正常的结束标记，否则 harness 会以为流是完整的。
-func (e *Engine) stream(w http.ResponseWriter, orig *http.Request, resp *http.Response, g *groupRuntime, up *upstreamRuntimeCfg, upstream string, headerLatency time.Duration, start time.Time) {
+func (e *Engine) stream(w http.ResponseWriter, orig *http.Request, resp *http.Response, g *groupRuntime, up *upstreamRuntimeCfg, upstream string, headerLatency time.Duration, start time.Time) (success bool) {
 	defer resp.Body.Close()
 
 	dst := w.Header()
@@ -757,7 +929,7 @@ func (e *Engine) stream(w http.ResponseWriter, orig *http.Request, resp *http.Re
 	setDeadline()
 	w.WriteHeader(resp.StatusCode)
 	if err := rc.Flush(); err != nil {
-		e.log.Debug("client flush failed", "group", g.name, "upstream", upstream, "err", err)
+		e.log.Debug("client flush failed", "group", g.name, "upstream", upstream, "err", errString(err))
 		return
 	}
 
@@ -800,7 +972,7 @@ func (e *Engine) stream(w http.ResponseWriter, orig *http.Request, resp *http.Re
 
 	if clientGone {
 		// 客户端自己断开，不归因于线路；上游请求会随 context 取消。
-		e.log.Debug("client went away", "group", g.name, "upstream", upstream, "err", readErr, "bytes", total)
+		e.log.Debug("client went away", "group", g.name, "upstream", upstream, "err", redactURLText(errString(readErr)), "bytes", total)
 		return
 	}
 
@@ -818,34 +990,34 @@ func (e *Engine) stream(w http.ResponseWriter, orig *http.Request, resp *http.Re
 	// resp.Body.Read 返回 context canceled——这不是截断，不能记成线路失败。
 	if orig.Context().Err() != nil {
 		e.log.Debug("client canceled during stream", "group", g.name, "upstream", upstream,
-			"err", readErr, "bytes", total)
+			"err", redactURLText(errString(readErr)), "bytes", total)
 		return
 	}
 
 	// 一次尝试只提交一个终态，避免同一请求既算成功又算失败。
 	switch {
 	case idleFired.Load():
-		e.store.RecordFailure(g.name, upstream, "stream idle timeout", time.Since(start))
+		e.store.RecordFailure(g.cfg, g.name, upstream, "stream idle timeout", time.Since(start))
 		panic(http.ErrAbortHandler)
 	case truncated:
-		e.store.RecordFailure(g.name, upstream, "stream truncated: "+readErr.Error(), time.Since(start))
+		e.store.RecordFailure(g.cfg, g.name, upstream, "stream truncated: "+redactURLText(readErr.Error()), time.Since(start))
 		e.events.Add(Event{Level: "error", Kind: "request", Group: g.name, Upstream: upstream,
 			Status: resp.StatusCode, DurationMS: time.Since(start).Milliseconds(),
-			Message: "响应流异常结束（可能被截断）: " + shorten(readErr.Error(), 200)})
+			Message: "响应流异常结束（可能被截断）: " + shorten(redactURLText(readErr.Error()), 200)})
 		panic(http.ErrAbortHandler)
 	case statusFailed:
-		e.store.RecordFailure(g.name, upstream, fmt.Sprintf("HTTP %d 被该线路配置计为故障", resp.StatusCode), time.Since(start))
+		e.store.RecordFailure(g.cfg, g.name, upstream, fmt.Sprintf("HTTP %d 被该线路配置计为故障", resp.StatusCode), time.Since(start))
 		e.events.Add(Event{Level: "warn", Kind: "health", Group: g.name, Upstream: upstream,
 			Status: resp.StatusCode, DurationMS: time.Since(start).Milliseconds(),
 			Message: fmt.Sprintf("按配置把 HTTP %d 计为线路故障", resp.StatusCode)})
 	case resp.StatusCode >= 500:
 		// 上游自身错误：计入失败数，但不改变线路健康状态。
-		e.store.RecordHTTPError(g.name, upstream, time.Since(start))
+		e.store.RecordHTTPError(g.cfg, g.name, upstream, time.Since(start))
 		e.events.Add(Event{Level: "warn", Kind: "request", Group: g.name, Upstream: upstream,
 			Status: resp.StatusCode, DurationMS: time.Since(start).Milliseconds(),
 			Message: fmt.Sprintf("上游返回 %d", resp.StatusCode)})
 	default:
-		e.store.RecordSuccess(g.name, upstream, time.Since(start))
+		e.store.RecordSuccess(g.cfg, g.name, upstream, time.Since(start))
 		e.events.Add(Event{Level: "info", Kind: "request", Group: g.name, Upstream: upstream,
 			Status: resp.StatusCode, DurationMS: time.Since(start).Milliseconds(),
 			Message: fmt.Sprintf("%s %s → %d", orig.Method, orig.URL.Path, resp.StatusCode)})
@@ -854,6 +1026,7 @@ func (e *Engine) stream(w http.ResponseWriter, orig *http.Request, resp *http.Re
 	if headerLatency > 3*time.Second {
 		e.log.Info("slow first byte", "group", g.name, "upstream", upstream, "header_ms", headerLatency.Milliseconds(), "bytes", total)
 	}
+	return !statusFailed && resp.StatusCode < 500
 }
 
 func writeProxyError(w http.ResponseWriter, group, upstream string, err error) {

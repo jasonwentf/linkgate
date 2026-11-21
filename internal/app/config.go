@@ -9,13 +9,18 @@
 package app
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,7 +51,20 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
-func (d Duration) MarshalYAML() (any, error) { return d.Duration.String(), nil }
+func (d Duration) MarshalYAML() (any, error)    { return d.Duration.String(), nil }
+func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(d.Duration.String()) }
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("时长应为字符串（示例：2s、90s）: %w", err)
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil || v < 0 {
+		return fmt.Errorf("无效时长 %q（示例：2s、90s；不能为负）", s)
+	}
+	d.Duration = v
+	return nil
+}
 
 // Or 返回自身；为零值时返回 def。
 func (d Duration) Or(def time.Duration) time.Duration {
@@ -65,7 +83,13 @@ type Config struct {
 	HTTP    HTTPConfig    `yaml:"http" json:"http"`
 	Retry   RetryConfig   `yaml:"retry" json:"retry"`
 	Health  HealthConfig  `yaml:"health" json:"health"`
+	UI      UIConfig      `yaml:"ui,omitempty" json:"ui"`
 	Groups  []GroupConfig `yaml:"groups" json:"groups"`
+}
+
+type UIConfig struct {
+	ServiceOrder []string `yaml:"service_order,omitempty" json:"service_order"`
+	SortMode     string   `yaml:"sort_mode,omitempty" json:"sort_mode"`
 }
 
 type AdminConfig struct {
@@ -76,10 +100,12 @@ type AdminConfig struct {
 }
 
 type LogConfig struct {
-	Level    string `yaml:"level" json:"level"`
-	Format   string `yaml:"format" json:"format"` // text | json
-	File     string `yaml:"file,omitempty" json:"file,omitempty"`
-	RingSize int    `yaml:"ring_size,omitempty" json:"ring_size,omitempty"`
+	Level        string `yaml:"level" json:"level"`
+	Format       string `yaml:"format" json:"format"` // text | json
+	File         string `yaml:"file,omitempty" json:"file,omitempty"`
+	RingSize     int    `yaml:"ring_size,omitempty" json:"ring_size,omitempty"`
+	MaxSizeBytes int64  `yaml:"max_size_bytes,omitempty" json:"max_size_bytes,omitempty"`
+	MaxBackups   int    `yaml:"max_backups,omitempty" json:"max_backups,omitempty"`
 }
 
 type BufferConfig struct {
@@ -88,7 +114,8 @@ type BufferConfig struct {
 	// SpillThreshold 小于此值放内存，大于则落临时文件（请求体常达数 MB）。
 	SpillThreshold int64 `yaml:"spill_threshold" json:"spill_threshold"`
 	// MaxConcurrent 同时缓冲的请求数上限，超出排队。
-	MaxConcurrent int `yaml:"max_concurrent" json:"max_concurrent"`
+	MaxConcurrent       int `yaml:"max_concurrent" json:"max_concurrent"`
+	GlobalMaxConcurrent int `yaml:"global_max_concurrent" json:"global_max_concurrent"`
 	// TempDir 落盘位置，空则用系统临时目录。
 	TempDir string `yaml:"temp_dir,omitempty" json:"temp_dir,omitempty"`
 	// ReadIdleTimeout 是从客户端读取请求体的总期限（本机回环场景，默认 120s）。
@@ -111,7 +138,7 @@ type HTTPConfig struct {
 	ReconnectAfterIdle      Duration `yaml:"reconnect_after_idle" json:"reconnect_after_idle"`
 	KeepAlive               Duration `yaml:"keep_alive" json:"keep_alive"`
 	MaxIdleConnsPerHost     int      `yaml:"max_idle_conns_per_host" json:"max_idle_conns_per_host"`
-	DisableCompression      bool     `yaml:"disable_compression" json:"disable_compression"`
+	DisableCompression      *bool    `yaml:"disable_compression,omitempty" json:"disable_compression,omitempty"`
 	ResponseHeaderWarnAfter Duration `yaml:"response_header_warn_after,omitempty" json:"response_header_warn_after,omitempty"`
 }
 
@@ -124,23 +151,33 @@ type RetryConfig struct {
 	Backoff Duration `yaml:"backoff,omitempty" json:"backoff,omitempty"`
 }
 
+type ProbeConfig struct {
+	Type         string   `yaml:"type,omitempty" json:"type,omitempty"` // http | tcp_connect
+	Path         string   `yaml:"path,omitempty" json:"path,omitempty"`
+	Method       string   `yaml:"method,omitempty" json:"method,omitempty"`
+	Timeout      Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	ExpectStatus int      `yaml:"expect_status,omitempty" json:"expect_status,omitempty"`
+}
+
 type HealthConfig struct {
-	Enabled          bool     `yaml:"enabled" json:"enabled"`
-	Interval         Duration `yaml:"interval" json:"interval"`
-	Timeout          Duration `yaml:"timeout" json:"timeout"`
-	FailThreshold    int      `yaml:"fail_threshold" json:"fail_threshold"`
-	RecoverThreshold int      `yaml:"recover_threshold" json:"recover_threshold"`
-	Cooldown         Duration `yaml:"cooldown" json:"cooldown"`
-	ProbePath        string   `yaml:"probe_path" json:"probe_path"`
-	ProbeMethod      string   `yaml:"probe_method" json:"probe_method"`
+	Probe            ProbeConfig `yaml:"probe,omitempty" json:"probe,omitempty"`
+	Enabled          bool        `yaml:"enabled" json:"enabled"`
+	Interval         Duration    `yaml:"interval" json:"interval"`
+	Timeout          Duration    `yaml:"timeout" json:"timeout"`
+	FailThreshold    int         `yaml:"fail_threshold" json:"fail_threshold"`
+	RecoverThreshold int         `yaml:"recover_threshold" json:"recover_threshold"`
+	Cooldown         Duration    `yaml:"cooldown" json:"cooldown"`
+	ProbePath        string      `yaml:"probe_path" json:"probe_path"`
+	ProbeMethod      string      `yaml:"probe_method" json:"probe_method"`
 	// ExpectStatus 探针认作健康的响应码；0 表示 200-399。
 	ExpectStatus int `yaml:"expect_status,omitempty" json:"expect_status,omitempty"`
 }
 
 type GroupConfig struct {
-	Name    string `yaml:"name" json:"name"`
-	Listen  string `yaml:"listen" json:"listen"`
-	Comment string `yaml:"comment,omitempty" json:"comment,omitempty"`
+	Protocol string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
+	Name     string `yaml:"name" json:"name"`
+	Listen   string `yaml:"listen" json:"listen"`
+	Comment  string `yaml:"comment,omitempty" json:"comment,omitempty"`
 	// StripPrefix 转发前去掉的路径前缀（一般留空）。
 	StripPrefix string `yaml:"strip_prefix,omitempty" json:"strip_prefix,omitempty"`
 	// AddHeaders 该组所有上游共用的附加请求头（一般留空）。
@@ -148,15 +185,18 @@ type GroupConfig struct {
 
 	TimeoutOverrides HTTPConfig `yaml:"timeout_overrides,omitempty" json:"timeout_overrides,omitempty"`
 
+	UARules   []UARuleConfig   `yaml:"ua_rules,omitempty" json:"ua_rules"`
 	Upstreams []UpstreamConfig `yaml:"upstreams" json:"upstreams"`
 }
 
 type UpstreamConfig struct {
-	Name     string `yaml:"name" json:"name"`
-	URL      string `yaml:"url" json:"url"`
-	Priority int    `yaml:"priority" json:"priority"`
-	Enabled  *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	Comment  string `yaml:"comment,omitempty" json:"comment,omitempty"`
+	Kind     string      `yaml:"kind,omitempty" json:"kind,omitempty"`
+	Probe    ProbeConfig `yaml:"probe,omitempty" json:"probe,omitempty"`
+	Name     string      `yaml:"name" json:"name"`
+	URL      string      `yaml:"url" json:"url"`
+	Priority *int        `yaml:"priority,omitempty" json:"priority,omitempty"`
+	Enabled  *bool       `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Comment  string      `yaml:"comment,omitempty" json:"comment,omitempty"`
 
 	// Host 覆盖发往上游的 Host 头；留空则用上游 URL 的 host:port。
 	Host string `yaml:"host,omitempty" json:"host,omitempty"`
@@ -182,8 +222,15 @@ type UpstreamConfig struct {
 }
 
 func (u UpstreamConfig) IsEnabled() bool { return u.Enabled == nil || *u.Enabled }
+func (u UpstreamConfig) PriorityValue() int {
+	if u.Priority == nil {
+		return 0
+	}
+	return *u.Priority
+}
 
-// Base 返回解析后的上游根地址（scheme://host:port，无尾斜杠、无 path）。
+// Base 返回解析后的上游 URL，保留 path 前缀用于转发与探针。
+// 解析失败时错误文案必须脱敏：原始 URL 里可能带 userinfo 或 query 秘密。
 func (u UpstreamConfig) Base() (*url.URL, error) {
 	raw := strings.TrimSpace(u.URL)
 	if raw == "" {
@@ -191,7 +238,7 @@ func (u UpstreamConfig) Base() (*url.URL, error) {
 	}
 	pu, err := url.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("upstream %q: url 解析失败: %w", u.Name, err)
+		return nil, fmt.Errorf("upstream %q: url 解析失败: %s", u.Name, redactURLText(err.Error()))
 	}
 	if pu.Scheme != "http" && pu.Scheme != "https" {
 		return nil, fmt.Errorf("upstream %q: url 只支持 http/https，当前 %q", u.Name, pu.Scheme)
@@ -199,25 +246,35 @@ func (u UpstreamConfig) Base() (*url.URL, error) {
 	if pu.Hostname() == "" {
 		return nil, fmt.Errorf("upstream %q: url 缺少主机名", u.Name)
 	}
+	if port := pu.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("upstream %q: url 端口必须为 1..65535", u.Name)
+		}
+	}
 	return pu, nil
 }
 
 func Default() *Config {
 	return &Config{
 		Version: 1,
+		UI:      UIConfig{SortMode: "added"},
 		Admin: AdminConfig{
 			Listen: "127.0.0.1:8766",
 		},
 		Log: LogConfig{
-			Level:    "info",
-			Format:   "text",
-			RingSize: 500,
+			Level:        "info",
+			Format:       "text",
+			RingSize:     2000,
+			MaxSizeBytes: 10 << 20,
+			MaxBackups:   3,
 		},
 		Buffer: BufferConfig{
-			MaxRequestBytes: 128 << 20,
-			SpillThreshold:  8 << 20,
-			MaxConcurrent:   64,
-			ReadIdleTimeout: Duration{120 * time.Second},
+			MaxRequestBytes:     128 << 20,
+			SpillThreshold:      8 << 20,
+			MaxConcurrent:       64,
+			GlobalMaxConcurrent: 64,
+			ReadIdleTimeout:     Duration{120 * time.Second},
 		},
 		HTTP: HTTPConfig{
 			ConnectTimeout:          Duration{2 * time.Second},
@@ -229,7 +286,7 @@ func Default() *Config {
 			ReconnectAfterIdle:      Duration{60 * time.Second},
 			KeepAlive:               Duration{30 * time.Second},
 			MaxIdleConnsPerHost:     16,
-			DisableCompression:      true,
+			DisableCompression:      boolPtr(true),
 			ResponseHeaderWarnAfter: Duration{120 * time.Second},
 		},
 		Retry: RetryConfig{
@@ -286,13 +343,9 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件 %s 失败: %w", path, err)
 	}
-	cfg := Default()
-	if err := yaml.Unmarshal(b, cfg); err != nil {
-		return nil, fmt.Errorf("解析配置文件 %s 失败: %w", path, err)
-	}
-	cfg.applyDefaults()
-	if err := cfg.Validate(); err != nil {
-		return nil, err
+	cfg, err := Parse(b)
+	if err != nil {
+		return nil, fmt.Errorf("配置文件 %s: %w", path, err)
 	}
 	return cfg, nil
 }
@@ -300,8 +353,14 @@ func Load(path string) (*Config, error) {
 // Parse 从字节解析配置（面板保存走这条路径）。
 func Parse(b []byte) (*Config, error) {
 	cfg := Default()
-	if err := yaml.Unmarshal(b, cfg); err != nil {
-		return nil, fmt.Errorf("YAML 解析失败: %w", err)
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil {
+		return nil, fmt.Errorf("YAML 解析失败（请检查字段拼写）: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("配置只允许一个 YAML 文档")
 	}
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
@@ -317,6 +376,9 @@ func (c *Config) applyDefaults() {
 		c.Version = 1
 	}
 	d := Default()
+	if c.UI.SortMode == "" {
+		c.UI.SortMode = d.UI.SortMode
+	}
 	if c.DataDir == "" {
 		if home, err := os.UserHomeDir(); err == nil {
 			c.DataDir = filepath.Join(home, ".linkgate")
@@ -337,6 +399,18 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Log.RingSize <= 0 {
 		c.Log.RingSize = d.Log.RingSize
+	}
+	if c.Log.MaxSizeBytes == 0 {
+		c.Log.MaxSizeBytes = d.Log.MaxSizeBytes
+	}
+	if c.Log.MaxBackups == 0 {
+		c.Log.MaxBackups = d.Log.MaxBackups
+	}
+	if c.Buffer.GlobalMaxConcurrent == 0 {
+		c.Buffer.GlobalMaxConcurrent = d.Buffer.GlobalMaxConcurrent
+	}
+	if c.HTTP.DisableCompression == nil {
+		c.HTTP.DisableCompression = d.HTTP.DisableCompression
 	}
 	if c.Buffer.MaxRequestBytes <= 0 {
 		c.Buffer.MaxRequestBytes = d.Buffer.MaxRequestBytes
@@ -409,6 +483,9 @@ func (c *Config) applyDefaults() {
 	}
 	for gi := range c.Groups {
 		g := &c.Groups[gi]
+		if g.Protocol == "" {
+			g.Protocol = "http"
+		}
 		if g.Listen == "" && gi == 0 {
 			g.Listen = "127.0.0.1:8765"
 		}
@@ -418,8 +495,9 @@ func (c *Config) applyDefaults() {
 				u.Name = fmt.Sprintf("upstream-%d", ui+1)
 			}
 			// 未显式给优先级时按书写顺序，越靠前越优先。
-			if u.Priority == 0 {
-				u.Priority = (ui + 1) * 10
+			if u.Priority == nil {
+				v := (ui + 1) * 10
+				u.Priority = &v
 			}
 		}
 	}
@@ -455,11 +533,33 @@ func (c *Config) Validate() error {
 	if c.Buffer.SpillThreshold > c.Buffer.MaxRequestBytes {
 		errs = append(errs, "buffer.spill_threshold 不能大于 buffer.max_request_bytes")
 	}
-	if len(c.Groups) == 0 {
-		errs = append(errs, "至少需要一个 groups 条目")
+	if c.Log.MaxSizeBytes <= 0 || c.Log.MaxBackups < 1 || c.Log.MaxBackups > 100 {
+		errs = append(errs, "log.max_size_bytes 必须大于 0，log.max_backups 必须为 1..100")
+	}
+	if c.Log.RingSize < 1 || c.Log.RingSize > 100000 {
+		errs = append(errs, "log.ring_size 必须为 1..100000")
+	}
+	if c.Buffer.MaxConcurrent <= 0 || c.Buffer.GlobalMaxConcurrent <= 0 {
+		errs = append(errs, "buffer.max_concurrent 与 global_max_concurrent 必须大于 0")
+	}
+	if err := validateHTTP(c.HTTP); err != nil {
+		errs = append(errs, "http: "+err.Error())
+	}
+	if c.Buffer.MaxRequestBytes <= 0 || c.Buffer.SpillThreshold <= 0 || c.Buffer.ReadIdleTimeout.Duration < 0 {
+		errs = append(errs, "buffer 大小/超时无效")
+	}
+	if c.Health.Interval.Duration < 0 || c.Health.Timeout.Duration < 0 || c.Health.Cooldown.Duration < 0 {
+		errs = append(errs, "health 时长不能为负")
+	}
+	if c.Health.ExpectStatus != 0 && (c.Health.ExpectStatus < 100 || c.Health.ExpectStatus > 599) {
+		errs = append(errs, "health.expect_status 必须为 100..599")
+	}
+	if err := validateProbe(c.Health.Probe); err != nil {
+		errs = append(errs, "health.probe: "+err.Error())
 	}
 
 	listens := map[string]string{}
+	conflict := false
 	if !c.Admin.Disabled {
 		listens[c.Admin.Listen] = "admin"
 	}
@@ -472,17 +572,35 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Sprintf("group 名称重复: %q", g.Name))
 		} else {
 			groupNames[g.Name] = true
+			if err := validResourceName(g.Name); err != nil {
+				errs = append(errs, prefix+".name: "+err.Error())
+			}
 			prefix = fmt.Sprintf("group %q", g.Name)
+		}
+		switch g.Protocol {
+		case "", "http":
+		case "tcp":
+			errs = append(errs, prefix+".protocol: tcp 暂未支持（当前只支持 http）")
+		default:
+			errs = append(errs, prefix+".protocol 只支持 http；tcp 暂未支持")
+		}
+		if err := validateHTTP(g.TimeoutOverrides); err != nil {
+			errs = append(errs, prefix+".timeout_overrides: "+err.Error())
+		}
+		if err := validateHeaders(g.AddHeaders); err != nil {
+			errs = append(errs, prefix+".add_headers: "+err.Error())
 		}
 		if err := validListen(g.Listen); err != nil {
 			errs = append(errs, prefix+".listen: "+err.Error())
-		} else if owner, dup := listens[g.Listen]; dup {
-			errs = append(errs, fmt.Sprintf("%s.listen 与 %s 冲突: %s", prefix, owner, g.Listen))
+		} else if other, owner, dup := conflictingListen(listens, g.Listen); dup {
+			conflict = true
+			note := ""
+			if loopbackAliases(other, g.Listen) {
+				note = "（localhost 与 127.0.0.1/::1 视为同一回环端点，同端口只能保留一个监听）"
+			}
+			errs = append(errs, fmt.Sprintf("%s.listen 与 %s 冲突: %s%s", prefix, owner, g.Listen, note))
 		} else {
 			listens[g.Listen] = prefix
-		}
-		if len(g.Upstreams) == 0 {
-			errs = append(errs, prefix+" 至少需要一个 upstream")
 		}
 		upNames := map[string]bool{}
 		for ui, u := range g.Upstreams {
@@ -498,10 +616,14 @@ func (c *Config) Validate() error {
 			if _, err := u.Base(); err != nil {
 				errs = append(errs, up+": "+err.Error())
 			}
-			for k := range u.Headers {
-				if strings.ContainsAny(k, " \t\r\n:") {
-					errs = append(errs, up+": 请求头名非法: "+k)
-				}
+			if err := validateHeaders(u.Headers); err != nil {
+				errs = append(errs, up+": "+err.Error())
+			}
+			if u.ConnectTimeout.Duration < 0 || u.ResponseHeaderTimeout.Duration < 0 {
+				errs = append(errs, up+": 时长不能为负")
+			}
+			if err := validateProbe(u.Probe); err != nil {
+				errs = append(errs, up+".probe: "+err.Error())
 			}
 			if u.MaxBodyBytes < 0 {
 				errs = append(errs, up+": max_body_bytes 不能为负")
@@ -512,11 +634,168 @@ func (c *Config) Validate() error {
 				}
 			}
 		}
+		if err := validateUARules(g.UARules, upNames); err != nil {
+			errs = append(errs, prefix+"."+err.Error())
+		}
+	}
+	switch c.UI.SortMode {
+	case "manual", "recent", "added":
+	default:
+		errs = append(errs, "ui.sort_mode 只支持 manual/recent/added")
+	}
+	seenOrder := make(map[string]bool, len(c.UI.ServiceOrder))
+	for _, name := range c.UI.ServiceOrder {
+		if c.Group(name) == nil || seenOrder[name] {
+			errs = append(errs, "ui.service_order 必须为不重复的现有服务名")
+		}
+		seenOrder[name] = true
 	}
 	if len(errs) > 0 {
-		return errors.New("配置校验失败:\n  - " + strings.Join(errs, "\n  - "))
+		return &ConfigError{Err: errors.New("配置校验失败:\n  - " + strings.Join(errs, "\n  - ")), Conflict: conflict}
 	}
 	return nil
+}
+
+// ConfigError 汇总校验错误。Conflict 表示其中含监听地址冲突：
+// 与系统端口被占用同类，对外统一映射为 409，便于脚本统一处理。
+type ConfigError struct {
+	Err      error
+	Conflict bool
+}
+
+func (e *ConfigError) Error() string { return e.Err.Error() }
+func (e *ConfigError) Unwrap() error { return e.Err }
+
+// validationStatus 给校验错误选 HTTP 状态码：监听冲突 409，其余 400。
+func validationStatus(err error) int {
+	var ce *ConfigError
+	if errors.As(err, &ce) && ce.Conflict {
+		return 409
+	}
+	return 400
+}
+
+// validResourceName 校验会出现在 API 路径段里的资源名（线路组名）。
+//
+// ServeMux 会对请求路径做 Clean 并可能重定向，"."、".."、含斜杠或会被路径
+// 清理改写的名字会让随后 /groups/<name>/upstreams 之类的接口失配（创建成功却
+// 永远访问不到），所以在写入前直接拒绝。
+func validResourceName(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("不能为空")
+	}
+	if name != strings.TrimSpace(name) {
+		return errors.New("不能以空白开头或结尾")
+	}
+	if name == "." || name == ".." {
+		return errors.New(`不能为 "." 或 ".."`)
+	}
+	if strings.ContainsAny(name, "/?#\\") {
+		return errors.New("不能含 / ? # 或反斜杠")
+	}
+	if path.Clean(name) != name {
+		return errors.New("不能经路径清理改写（多余的斜杠或点段）")
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("不能含控制字符")
+		}
+	}
+	return nil
+}
+
+// conflictingListen 判断 addr 与已登记的监听地址是否真的会抢同一个端口。
+//
+// 不能按字符串比较：localhost / 127.0.0.1 / ::1 指向同一处本机回环；
+// 而 "0.0.0.0:p" 只占 IPv4、"::1:p" 只占 IPv6，二者在大多数系统上可以同时绑定。
+// 这里按实际会占用的地址族与通配范围判断，避免误报自冲突。
+func conflictingListen(listens map[string]string, addr string) (conflictAddr, owner string, dup bool) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", "", false
+	}
+	want := parseBindTarget(host)
+	for other, owner := range listens {
+		oh, op, err := net.SplitHostPort(other)
+		if err != nil || op != port {
+			continue
+		}
+		if want.overlaps(parseBindTarget(oh)) {
+			return other, owner, true
+		}
+	}
+	return "", "", false
+}
+
+// bindTarget 描述一个监听地址实际会占用的地址族与具体地址。
+type bindTarget struct {
+	v4Wild bool
+	v6Wild bool
+	v4     net.IP
+	v6     net.IP
+	name   string // 无法解析的主机名，只能按字符串比较
+}
+
+// parseBindTarget 把 host 归一化为绑定目标。
+// 空 host 与 "::" 在 Go 里默认双栈监听，视为同时占用 IPv4 与 IPv6。
+func parseBindTarget(host string) bindTarget {
+	h := strings.ToLower(strings.TrimSpace(host))
+	switch h {
+	case "", "::":
+		return bindTarget{v4Wild: true, v6Wild: true}
+	case "0.0.0.0":
+		return bindTarget{v4Wild: true}
+	case "localhost":
+		return bindTarget{v4: net.ParseIP("127.0.0.1"), v6: net.ParseIP("::1")}
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			if v4.IsUnspecified() {
+				return bindTarget{v4Wild: true}
+			}
+			return bindTarget{v4: v4}
+		}
+		if ip.IsUnspecified() {
+			return bindTarget{v6Wild: true}
+		}
+		return bindTarget{v6: ip}
+	}
+	return bindTarget{name: h}
+}
+
+func (b bindTarget) hasV4() bool { return b.v4Wild || b.v4 != nil }
+func (b bindTarget) hasV6() bool { return b.v6Wild || b.v6 != nil }
+
+// loopbackAliases 判断两个监听地址是否都是同一台本机的回环写法
+// （localhost / 127.0.0.1 / ::1），用于把冲突错误说得更直白。
+func loopbackAliases(a, b string) bool {
+	ha, _, errA := net.SplitHostPort(a)
+	hb, _, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	ta, tb := parseBindTarget(ha), parseBindTarget(hb)
+	return ta.isLoopback() && tb.isLoopback()
+}
+
+func (b bindTarget) isLoopback() bool {
+	if b.v4 != nil && b.v4.IsLoopback() {
+		return true
+	}
+	return b.v6 != nil && b.v6.IsLoopback()
+}
+
+func (b bindTarget) overlaps(o bindTarget) bool {
+	if b.name != "" || o.name != "" {
+		return b.name != "" && b.name == o.name
+	}
+	if b.hasV4() && o.hasV4() && (b.v4Wild || o.v4Wild || b.v4.Equal(o.v4)) {
+		return true
+	}
+	if b.hasV6() && o.hasV6() && (b.v6Wild || o.v6Wild || b.v6.Equal(o.v6)) {
+		return true
+	}
+	return false
 }
 
 func validListen(addr string) error {
@@ -529,6 +808,10 @@ func validListen(addr string) error {
 	}
 	if port == "" {
 		return errors.New("缺少端口")
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return errors.New("端口必须为 1..65535 的数字")
 	}
 	if host == "" {
 		// 允许 :8765，但会监听所有网卡，给出提示由调用方决定
@@ -582,5 +865,65 @@ func (c *Config) EffectiveHTTP(g *GroupConfig) HTTPConfig {
 	if o.ResponseHeaderWarnAfter.Duration > 0 {
 		out.ResponseHeaderWarnAfter = o.ResponseHeaderWarnAfter
 	}
+	if o.IdleConnTimeout.Duration > 0 {
+		out.IdleConnTimeout = o.IdleConnTimeout
+	}
+	if o.KeepAlive.Duration > 0 {
+		out.KeepAlive = o.KeepAlive
+	}
+	if o.MaxIdleConnsPerHost > 0 {
+		out.MaxIdleConnsPerHost = o.MaxIdleConnsPerHost
+	}
+	if o.DisableCompression != nil {
+		out.DisableCompression = o.DisableCompression
+	}
 	return out
+}
+
+func boolPtr(v bool) *bool { return &v }
+func compressionDisabled(c HTTPConfig) bool {
+	return c.DisableCompression == nil || *c.DisableCompression
+}
+
+func validateHeaders(h map[string]string) error {
+	for k, v := range h {
+		if k == "" || strings.ContainsAny(k, " \t\r\n:") || strings.ContainsAny(v, "\r\n") {
+			return fmt.Errorf("请求头非法: %q", k)
+		}
+	}
+	return nil
+}
+
+func validateHTTP(h HTTPConfig) error {
+	for _, d := range []Duration{h.ConnectTimeout, h.TLSHandshakeTimeout, h.ResponseHeaderTimeout, h.StreamIdleTimeout, h.UploadIdleTimeout, h.IdleConnTimeout, h.ReconnectAfterIdle, h.KeepAlive, h.ResponseHeaderWarnAfter} {
+		if d.Duration < 0 {
+			return errors.New("时长不能为负")
+		}
+	}
+	if h.MaxIdleConnsPerHost < 0 {
+		return errors.New("max_idle_conns_per_host 不能为负")
+	}
+	return nil
+}
+
+func validateProbe(p ProbeConfig) error {
+	if p.Timeout.Duration < 0 {
+		return errors.New("timeout 不能为负")
+	}
+	if p.Method != "" {
+		for _, c := range p.Method {
+			if !strings.ContainsRune("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", c) {
+				return errors.New("method 非法")
+			}
+		}
+	}
+	switch p.Type {
+	case "", "http", "tcp_connect":
+	default:
+		return fmt.Errorf("type %q 暂未支持（可用 http/tcp_connect）", p.Type)
+	}
+	if p.ExpectStatus != 0 && (p.ExpectStatus < 100 || p.ExpectStatus > 599) {
+		return errors.New("expect_status 必须为 100..599")
+	}
+	return nil
 }

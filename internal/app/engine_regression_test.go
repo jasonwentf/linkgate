@@ -45,8 +45,8 @@ func TestNoFailoverAfterRequestBodyDelivered(t *testing.T) {
 	defer bad.Close()
 
 	cfg := testConfig(
-		UpstreamConfig{Name: "bad", URL: bad.URL, TLSInsecureSkipVerify: true, Priority: 1},
-		UpstreamConfig{Name: "backup", URL: backup.URL, Priority: 2},
+		UpstreamConfig{Name: "bad", URL: bad.URL, TLSInsecureSkipVerify: true, Priority: intPtr(1)},
+		UpstreamConfig{Name: "backup", URL: backup.URL, Priority: intPtr(2)},
 	)
 	engine, _, _ := testEngine(t, cfg)
 
@@ -100,8 +100,8 @@ func TestUploadStallAbortsWithoutFailover(t *testing.T) {
 	defer backup.Close()
 
 	cfg := testConfig(
-		UpstreamConfig{Name: "stalled", URL: "http://" + ln.Addr().String(), Priority: 1},
-		UpstreamConfig{Name: "backup", URL: backup.URL, Priority: 2},
+		UpstreamConfig{Name: "stalled", URL: "http://" + ln.Addr().String(), Priority: intPtr(1)},
+		UpstreamConfig{Name: "backup", URL: backup.URL, Priority: intPtr(2)},
 	)
 	cfg.HTTP.UploadIdleTimeout = Duration{200 * time.Millisecond}
 	cfg.HTTP.ResponseHeaderTimeout = Duration{30 * time.Second}
@@ -145,8 +145,8 @@ func TestRuntimeDisabledUpstreamIsNeverSelected(t *testing.T) {
 	defer backup.Close()
 
 	cfg := testConfig(
-		UpstreamConfig{Name: "primary", URL: primary.URL, Priority: 1},
-		UpstreamConfig{Name: "backup", URL: backup.URL, Priority: 2},
+		UpstreamConfig{Name: "primary", URL: primary.URL, Priority: intPtr(1)},
+		UpstreamConfig{Name: "backup", URL: backup.URL, Priority: intPtr(2)},
 	)
 	engine, store, _ := testEngine(t, cfg)
 	store.SetEnabled("test", "primary", false)
