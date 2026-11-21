@@ -1,9 +1,14 @@
 # Linkgate
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Platform: macOS | Windows | Linux](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)
+![Go](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)
 
 Linkgate 是一个运行在本地的透明 HTTP 反向代理，用来为本机的各类客户端工具提供固定的本地接入地址，并在后台的多条网络线路之间自动切换。
+
+![Linkgate 全局仪表盘](docs/images/dashboard.png)
 
 日常同时使用 Claude Code、Cursor、Codex 或 OpenCode 等工具连接远端推理服务时，后端机器往往同时配有 Tailscale、ZeroTier、Cloudflare Tunnel 或自建 FRP 中转等多条访问路径。如果把某条线路的地址直接写死在每个工具的配置里，一旦当前隧道波动或网络中断，所有工具都会同时报错，只能手动逐个修改配置。Linkgate 在本机监听一个固定端口，让所有客户端统一连向本地，再由它在后台按优先级挑选可用线路完成转发，客户端无需感知底层的网络切换。
 

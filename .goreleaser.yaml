@@ -1,0 +1,117 @@
+version: 2
+
+project_name: linkgate
+
+builds:
+  - id: kernel
+    main: ./cmd/linkgate
+    binary: linkgate
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X linkgate/internal/app.Version={{.Version}} -X main.version={{.Version}}
+    flags:
+      - -trimpath
+
+  - id: tray
+    main: ./cmd/linkgate-tray
+    binary: linkgate-tray
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    flags:
+      - -trimpath
+    overrides:
+      - goos: windows
+        goarch: amd64
+        env:
+          - CGO_ENABLED=0
+      - goos: darwin
+        goarch: amd64
+        env:
+          - CGO_ENABLED=1
+          - CC=clang -arch x86_64
+          - CXX=clang++ -arch x86_64
+
+archives:
+  - id: kernel-pkg
+    ids: [kernel]
+    name_template: "linkgate_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - README.en.md
+      - configs/linkgate.example.yaml
+      - deploy/linkgate.service
+
+  - id: tray-pkg
+    ids: [tray]
+    name_template: "linkgate-tray_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+
+nfpms:
+  - id: linkgate
+    package_name: linkgate
+    ids: [kernel]
+    formats: [deb, rpm, ipk]
+    file_name_template: "linkgate_{{ .Version }}_{{ .Arch }}"
+    vendor: Linkgate
+    homepage: https://github.com/jasonwentf/linkgate
+    maintainer: JasonWen
+    description: >-
+      Local transparent HTTP reverse proxy. One fixed local address,
+      multiple upstream routes, automatic failover. Kernel only; the
+      web panel is served by the kernel itself.
+    license: MIT
+    bindir: /usr/bin
+    contents:
+      - src: configs/linkgate.example.yaml
+        dst: /etc/linkgate/config.yaml
+        type: config|noreplace
+        file_info:
+          mode: 0640
+          owner: root
+          group: linkgate
+      - src: deploy/linkgate.service
+        dst: /usr/lib/systemd/system/linkgate.service
+    scripts:
+      postinstall: ./deploy/nfpm-postinstall.sh
+      preremove: ./deploy/nfpm-preremove.sh
+      postremove: ./deploy/nfpm-postremove.sh
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

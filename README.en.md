@@ -1,9 +1,14 @@
 # Linkgate
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Platform: macOS | Windows | Linux](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)
+![Go](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)
 
 Linkgate is a transparent HTTP reverse proxy that runs locally. It gives every client tool on your machine one fixed local address, and silently fails over between multiple upstream routes in the background.
+
+![Linkgate dashboard](docs/images/dashboard.png)
 
 When you run tools like Claude Code, Cursor, Codex, or OpenCode against a remote inference service, that backend usually sits behind several paths at once — Tailscale, ZeroTier, a Cloudflare Tunnel, a self-hosted FRP relay. Hardcode any one of those addresses into every tool, and the moment that tunnel flaps or drops, everything errors at once and you end up editing configs by hand. Linkgate listens on a fixed local port instead. Clients point at localhost; it picks the first reachable route and forwards. Clients never see the switch.
 
