@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -203,8 +204,13 @@ func TestEngineRequestBodySpillsAndCleansUp(t *testing.T) {
 	if !bytes.Equal(got.body, payload) {
 		t.Errorf("upstream body differs: got %d bytes, want %d", len(got.body), len(payload))
 	}
-	if got.files != 1 || got.fileSize != int64(len(payload)) || got.length != int64(len(payload)) {
+	if got.files != 1 || got.length != int64(len(payload)) {
 		t.Errorf("spill observation: files=%d size=%d content-length=%d", got.files, got.fileSize, got.length)
+	}
+	// Windows 对被引用中的临时文件返回的目录大小不可靠（NTFS 延迟更新），
+	// files==1 已证明落盘、收尾的 assertTempDirEmpty 验证清理，精确大小只在其他平台断言。
+	if runtime.GOOS != "windows" && got.fileSize != int64(len(payload)) {
+		t.Errorf("spill file size: got %d, want %d", got.fileSize, len(payload))
 	}
 	assertTempDirEmpty(t, tempDir)
 }
