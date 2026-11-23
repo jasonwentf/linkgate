@@ -99,7 +99,7 @@ func windowsTaskXML(sid, executable, config, directory string, autostart bool) s
 	if autostart {
 		trigger = "<LogonTrigger><Enabled>true</Enabled><UserId>" + escape(sid) + "</UserId></LogonTrigger>"
 	}
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>Linkgate 当前用户后台内核</Description></RegistrationInfo>
   <Triggers>%s</Triggers>

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -73,11 +74,13 @@ $processes = @(Get-CimInstance Win32_Process -Filter "Name='linkgate.exe'" | Whe
 $trayTarget = ''
 $shortcut = Join-Path ([Environment]::GetFolderPath('Startup')) 'Linkgate Tray.lnk'
 if (Test-Path -LiteralPath $shortcut) { $trayTarget = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut).TargetPath }
-@{ SID = $sid; Task = $task; Processes = $processes; TrayTarget = $trayTarget } | ConvertTo-Json -Depth 5 -Compress
+# -NonInteractive 的 powershell.exe 会把管道输出序列化成 CLIXML；
+# JSON 必须经 [Console]::WriteLine 直写 stdout 绕开序列化。
+[Console]::WriteLine((@{ SID = $sid; Task = $task; Processes = $processes; TrayTarget = $trayTarget } | ConvertTo-Json -Depth 5 -Compress))
 `, nil)
 	var state windowsState
 	if err == nil {
-		err = json.Unmarshal(out, &state)
+		err = unmarshalWindowsState(out, &state)
 	}
 	if err == nil {
 		for i := range state.Processes {
@@ -101,6 +104,21 @@ if (Test-Path -LiteralPath $shortcut) { $trayTarget = (New-Object -ComObject WSc
 		}
 	}
 	return state, err
+}
+
+// stripWindowsCLIXML 在 -NonInteractive 下 PowerShell 可能把输出包成 CLIXML
+// （#< CLIXML 头 + <Objs> 包装 + progress 记录）。JSON 本体是第一个 '{' 起的
+// 完整值，交给 json.Decoder 读取首个 JSON 值，忽略其后的 CLIXML 残余。
+func stripWindowsCLIXML(out []byte) []byte {
+	start := bytes.IndexByte(out, '{')
+	if start < 0 {
+		return out
+	}
+	return out[start:]
+}
+
+func unmarshalWindowsState(out []byte, state *windowsState) error {
+	return json.NewDecoder(bytes.NewReader(stripWindowsCLIXML(out))).Decode(state)
 }
 
 func parseWindowsCommandLine(commandLine string) ([]string, error) {
@@ -204,7 +222,15 @@ func runInstall(configPath string, uninstall bool) error {
 		return err
 	}
 	defer os.Remove(xmlFile.Name())
-	_, writeErr := xmlFile.WriteString(windowsTaskXML(state.SID, executable, configPath, directory, windowsInstall.autostart))
+	// schtasks /XML 只认 UTF-16：文件按 UTF-16LE + BOM 写。
+	xmlText := windowsTaskXML(state.SID, executable, configPath, directory, windowsInstall.autostart)
+	utf16 := utf16.Encode([]rune(xmlText))
+	buf := make([]byte, 2+len(utf16)*2)
+	buf[0], buf[1] = 0xFF, 0xFE
+	for i, c := range utf16 {
+		binary.LittleEndian.PutUint16(buf[2+i*2:], c)
+	}
+	_, writeErr := xmlFile.Write(buf)
 	closeErr := xmlFile.Close()
 	if writeErr != nil {
 		return writeErr

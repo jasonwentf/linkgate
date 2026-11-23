@@ -30,6 +30,24 @@ func TestWindowsNativeCommandLine(t *testing.T) {
 	}
 }
 
+func TestUnmarshalWindowsStateThroughCLIXML(t *testing.T) {
+	clean := `{"TrayTarget":"","SID":"S-1-5-21-x","Processes":[],"Task":null}`
+	var want windowsState
+	if err := unmarshalWindowsState([]byte(clean), &want); err != nil {
+		t.Fatal(err)
+	}
+	for _, wrap := range []string{
+		"#< CLIXML\r\n" + clean,
+		"#< CLIXML\r\n" + clean + "\r\n<Objs Version=\"1.1.0.1\"></Objs>",
+		clean + "<Objs></Objs>",
+	} {
+		var got windowsState
+		if err := unmarshalWindowsState([]byte(wrap), &got); err != nil || got.SID != want.SID {
+			t.Fatalf("%q: %v %+v", wrap, err, got)
+		}
+	}
+}
+
 func TestWindowsHealthyInstanceConfig(t *testing.T) {
 	const config = `C:\用户\custom config.yaml`
 	path := config

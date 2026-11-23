@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/xml"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,7 +48,14 @@ func TestWindowsTaskXML(t *testing.T) {
 					}
 				}
 			}
-			if err := xml.Unmarshal([]byte(text), &task); err != nil {
+			decoder := xml.NewDecoder(strings.NewReader(text))
+			decoder.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
+				if strings.EqualFold(charset, "UTF-16") {
+					return input, nil
+				}
+				return nil, fmt.Errorf("unexpected charset %s", charset)
+			}
+			if err := decoder.Decode(&task); err != nil {
 				t.Fatal(err)
 			}
 			p := task.Principals.Principal
