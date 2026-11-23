@@ -95,31 +95,26 @@ See `configs/linkgate.example.yaml` for the full field reference.
 
 ### macOS
 
-`./scripts/install-macos.sh` builds, initializes config, and registers user LaunchAgents for auto-start and respawn. `./scripts/uninstall-macos.sh` removes the agents while keeping `~/.linkgate/`.
+1. Download `Linkgate-x.y.z.dmg` (for example `Linkgate-0.3.0.dmg`) from [Releases](https://github.com/jasonwentf/linkgate/releases), double-click to mount it, and drag `Linkgate.app` into **Applications**.
+2. Launch `Linkgate.app` from **Applications** (do not run it directly from the mounted DMG, or the tray will refuse to register with `launchd`). Because the app is unsigned and unnotarized, Gatekeeper will block the first launch: right-click `Linkgate.app` in Applications, choose **Open**, and click **Open** again in the confirmation dialog. You only need to do this once.
+3. On first launch, the tray registers the kernel as a user `LaunchAgent`, starts it in the background, and shows the Linkgate icon in the menu bar.
+
+For command-line installs, prebuilt `.tar.gz` archives are still included in each release, and `./scripts/install-macos.sh` (with `./scripts/uninstall-macos.sh`) remains available.
 
 ### Windows
 
 ![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows11&logoColor=white)
 
-For Windows 10/11 x64, use the prebuilt ZIP. No Go toolchain or administrator account is needed.
+For Windows 10/11 x64, use the graphical setup wizard. No Go toolchain or administrator account is needed.
 
-1. Download `linkgate_x.x.x_windows_amd64.zip` from [Releases](https://github.com/jasonwentf/linkgate/releases), for example `linkgate_0.2.2_windows_amd64.zip`.
-2. Right-click the ZIP → **Extract All**. Open the extracted folder, not the ZIP preview.
-3. Double-click `install.bat`. Wait for `Installed Linkgate` and press any key to close the window. The script copies both EXEs to `%LOCALAPPDATA%\Linkgate`, creates the default config only if missing, and starts the kernel and tray.
-4. Click the colored Linkgate logo at the bottom right → **打开面板** (Open panel). If hidden, click the tray's **^** arrow first. Add your services and routes in the panel; the initial config contains example addresses, not usable backends.
+1. Download `Linkgate-Setup-x.y.z-win64.exe` from [Releases](https://github.com/jasonwentf/linkgate/releases), for example `Linkgate-Setup-0.3.0-win64.exe`.
+2. Double-click the installer. Because the binary is unsigned, SmartScreen will prompt "Windows protected your PC". Click **More info**, then **Run anyway**.
+3. Step through the wizard from the welcome page (**Next** three times, then **Install**). Auto-start on logon and the system tray are checked by default. On the completion page, keep **Launch Linkgate and open panel** checked and click **Finish**.
+4. A colored Linkgate icon stays in the bottom-right system tray (click `^` if Windows hides it). On a fresh install, `~/.linkgate\config.yaml` starts with an empty `groups` list, and the panel guides you through adding your services and routes.
 
-The kernel runs as a current-user logon task with crash-restart. A Startup-folder shortcut starts the tray with the same config. Existing config/token files are kept. If SmartScreen blocks the unsigned download, check that it came from this repository and verify `checksums.txt` before choosing **More info → Run anyway**. Managed PCs may prohibit scripts or scheduled tasks; the installer reports the error rather than requesting elevation.
+Files are installed to `%LOCALAPPDATA%\Linkgate`. Under the hood, the installer calls the self-install subcommand `linkgate.exe -install` (and `linkgate.exe -uninstall` when uninstalling). The kernel runs in the background as a current-user S4U scheduled task without popping up a black console window, and the tray runs as a `windowsgui` process. Existing config and token files are kept on reinstall.
 
-#### Check and install an update
-
-Double-click `%LOCALAPPDATA%\Linkgate\check-update.bat` to compare the installed version with GitHub's latest stable release. This is an anonymous, opt-in request; it does not download or replace binaries. The kernel and tray also report their own versions with `-version`.
-
-1. Download the new `linkgate_x.x.x_windows_amd64.zip` and extract it into a new folder.
-2. Finish any active requests. Double-click `update.bat` **in the new folder**, then type `YES` when prompted.
-3. The script validates the new config compatibility and matching kernel/tray versions, refuses downgrades, backs up the old EXEs under `%LOCALAPPDATA%\Linkgate\backups`, stops tray then kernel, replaces both, and restarts them. Config and tokens are not replaced. Windows task/process termination interrupts in-flight requests; it is not a graceful drain.
-4. Open the panel from the tray and check your services. If replacement/startup fails, the updater attempts to restore both old EXEs and reports the backup path. For manual rollback, stop the Linkgate task and exit the tray, copy both backed-up EXEs to the installation folder, then start the task and the tray shortcut again.
-
-From a source checkout, run `make dist`, then `powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\install.ps1 -SourceDir .\bin\dist`. A custom config can be passed with `-Config`; its path is kept for updates. Updates work offline from an extracted ZIP; only `check-update.bat` needs internet access.
+**Portable ZIP and updates.** Releases also retain `linkgate_x.y.z_windows_amd64.zip` as a portable fallback; its `install.bat` calls `linkgate.exe -install` internally. Updates still go through `check-update.bat` and `update.bat` in `%LOCALAPPDATA%\Linkgate`.
 
 ### Linux
 
@@ -148,7 +143,6 @@ Listens on `127.0.0.1:8766` only. All `/__linkgate/v1/*` endpoints (except `/hea
 ## Roadmap
 
 - Generic TCP forwarding (SSH, database ports) — `protocol: tcp` is already reserved in the schema.
-- Prebuilt packages for macOS, Windows, and major Linux distributions.
 - HarmonyOS support (verification in progress).
 
 ## License

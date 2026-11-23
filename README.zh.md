@@ -204,43 +204,26 @@ groups:
 
 ### macOS（launchd）
 
-仓库提供了开箱即用的安装脚本，会自动编译内核与菜单栏托盘（若本机未安装 Xcode 命令行工具则仅编译内核），生成初始配置，并注册为用户级的 `LaunchAgent`，实现登录自动启动与异常拉起：
+1. 从 [Releases](https://github.com/jasonwentf/linkgate/releases) 下载 `Linkgate-x.y.z.dmg`（例如 `Linkgate-0.3.0.dmg`），双击挂载后将 `Linkgate.app` 拖入 **Applications**（应用程序）目录。
+2. 首次启动必须从 **Applications** 中双击打开，不能直接在挂载的 DMG 窗口里运行，否则托盘会拒绝注册 `launchd` 服务。由于应用尚未签名和公证，首次打开会被 Gatekeeper 拦截：请在 Applications 中右键点击 `Linkgate.app` 选择“打开”，在弹出的确认框中再次点击“打开”即可放行（只需操作一次）。
+3. 首次启动时，托盘会将内核注册为用户级 `LaunchAgent` 并在后台拉起，随后顶部菜单栏会出现 Linkgate 图标。
 
-```bash
-./scripts/install-macos.sh
-```
-
-如需卸载后台服务，可运行 `./scripts/uninstall-macos.sh`。卸载脚本只会移除启动项与二进制程序，会完整保留 `~/.linkgate/` 下的配置文件与令牌。
+如果习惯命令行安装，Releases 中仍保留 `tar.gz` 压缩包，仓库内的 `./scripts/install-macos.sh` 与 `./scripts/uninstall-macos.sh` 脚本也继续可用。
 
 ### Windows
 
 ![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows11&logoColor=white)
 
-Windows 10/11 x64 使用预编译 ZIP，不需要安装 Go，也不需要管理员权限。
+Windows 10 与 Windows 11（64 位）推荐使用向导安装器，不需要安装 Go 环境，也不需要管理员权限。
 
-1. 打开 [Releases](https://github.com/jasonwentf/linkgate/releases)，下载 `linkgate_x.x.x_windows_amd64.zip`，例如 `linkgate_0.2.2_windows_amd64.zip`。
-2. 右键 ZIP → **全部解压缩**，进入解压后的文件夹，不要在压缩包预览中运行。
-3. 双击 `install.bat`，等到显示 `Installed Linkgate` 后按任意键关闭窗口。脚本会把两个 EXE 复制到 `%LOCALAPPDATA%\Linkgate`，仅在配置不存在时自动执行 `-init`，然后启动内核与托盘。
-4. 点击右下角的彩色 Linkgate logo → **打开面板**。如果看不到图标，先点托盘的 **^** 隐藏图标箭头。在面板中添加你的服务与线路；初始配置里的示例地址不能直接作为真实后端使用。
+1. 打开 [Releases](https://github.com/jasonwentf/linkgate/releases)，下载 `Linkgate-Setup-x.y.z-win64.exe`（例如 `Linkgate-Setup-0.3.0-win64.exe`）。
+2. 双击运行安装器。由于安装器尚未签名，SmartScreen 会弹出“Windows 已保护你的电脑”，点击 **更多信息**，再点击 **仍要运行**。
+3. 从欢迎页起连续点击三次 **下一步**，再点击 **安装**。安装页默认勾选开机自启与创建托盘；在完成页保持勾选“立即启动 Linkgate 并打开面板”，点击 **完成**。
+4. 启动后，桌面右下角会常驻彩色的 Linkgate 托盘图标（若被折叠可先点托盘区的 `^` 箭头）。首次安装的配置文件位于 `~/.linkgate\config.yaml`，初始 `groups` 为空，按面板引导添加服务与线路即可。
 
-内核通过当前用户的登录计划任务自启，崩溃后自动拉起；托盘通过启动文件夹的快捷方式自启，使用同一份配置。已有配置与令牌不会被覆盖。下载文件尚未签名，若 SmartScreen 拦截，请先核实来自本仓库并对照 `checksums.txt`，再点 **更多信息 → 仍要运行**。受管理的电脑可能禁止脚本或计划任务，安装器会报错，不会自动提权。
+程序安装在 `%LOCALAPPDATA%\Linkgate`。安装器底层调用 `linkgate.exe -install`（卸载对应 `linkgate.exe -uninstall`）：内核以 S4U 计划任务在后台运行，不弹黑色命令行窗口；托盘是 `windowsgui` 程序。重装或升级时会自动保留已有的配置与令牌。
 
-#### 检查与安装更新
-
-双击 `%LOCALAPPDATA%\Linkgate\check-update.bat`，即可比较已安装版本与 GitHub 最新稳定版。这是手动触发的匿名请求，不下载或替换二进制。内核与托盘也都支持 `-version` 查看各自版本。
-
-1. 下载新版 `linkgate_x.x.x_windows_amd64.zip`，解压到一个新的文件夹。
-2. 等当前请求完成，双击**新文件夹里的** `update.bat`，看到确认提示后输入 `YES`。
-3. 脚本先校验新版兼容现有配置、内核与托盘版本一致，并拒绝降级；把旧 EXE 备份到 `%LOCALAPPDATA%\Linkgate\backups`，按“托盘 → 内核”顺序停止，替换两个 EXE，再重新启动。配置与令牌保持不变。Windows 的任务/进程终止会中断在途请求，不是优雅排空。
-4. 从托盘打开面板检查服务状态。替换或启动失败时，脚本会尝试恢复两个旧 EXE，并给出备份路径。手工回滚时，先停止 Linkgate 计划任务并退出托盘，把备份中的两个 EXE 复制回安装目录，再启动计划任务与托盘快捷方式。
-
-源码使用者可先运行 `make dist`，再执行：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\install.ps1 -SourceDir .\bin\dist
-```
-
-自定义配置可通过 `-Config` 指定，更新会沿用安装时的路径。从已解压的 ZIP 更新无需联网，只有 `check-update.bat` 需要访问 GitHub。
+**便携包与更新**：Releases 里同时保留 `linkgate_x.y.z_windows_amd64.zip` 作为便携备选，包内的 `install.bat` 内部同样调用 `linkgate.exe -install`。版本检查与更新仍通过 `%LOCALAPPDATA%\Linkgate` 目录下的 `check-update.bat` 和 `update.bat` 完成。
 
 ### Linux（systemd）
 
@@ -286,7 +269,6 @@ sudo systemctl enable --now linkgate
 ## 未来路线图
 
 - **SSH 等通用 TCP 转发**：当前监听管理器与配置结构已经预留了 `protocol: tcp` 的协议边界，后续将在 HTTP 透明代理之外提供通用的 TCP 端口多线路容灾能力，用于支撑 SSH 长连接或数据库端口的自动选路。
-- **更多平台安装包与分发渠道**：提供面向 macOS、Windows 与主流 Linux 发行版的预编译安装包与软件源，简化首次安装与版本升级流程。
 - **鸿蒙（HarmonyOS）平台适配**：目前正在推进鸿蒙系统的编译、后台保活与实机运行验证，验证成熟后将合入正式文档与构建流程。
 
 ## 许可证
