@@ -104,6 +104,26 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $([IO.Path]::GetFileName($setup))" | Set-Content -LiteralPath "$setup.sha256" -Encoding ascii
 
+      - name: Smoke-test the real silent installer
+        id: smoke
+        if: steps.release.outputs.tagged == 'true'
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          LINKGATE_RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $setup = (Resolve-Path "dist/windows-setup/Linkgate-Setup-$env:LINKGATE_RELEASE_VERSION-win64.exe").Path
+          # 单独的 pwsh 进程，避免纯事务测试的 mocks 污染真实任务/进程断言。
+          pwsh -NoProfile -File deploy/windows/installer_smoke_test.ps1 -Installer $setup
+          if ($LASTEXITCODE -ne 0) { throw 'Real silent installer smoke test failed.' }
+
+      - uses: actions/upload-artifact@v4
+        if: failure() && steps.smoke.outputs.logs != ''
+        with:
+          name: windows-installer-smoke-logs-${{ steps.release.outputs.version }}
+          path: ${{ steps.smoke.outputs.logs }}/*.log
+          if-no-files-found: warn
+
       - uses: actions/upload-artifact@v4
         if: steps.release.outputs.tagged == 'true'
         with:

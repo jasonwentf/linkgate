@@ -6,6 +6,7 @@ param(
     [string]$SourceDir = $PSScriptRoot,
     [ValidateSet('true', 'false')][string]$Autostart = 'true',
     [ValidateSet('true', 'false')][string]$WithTray = 'true',
+    [ValidateSet('true', 'false')][string]$OpenPanel = 'false',
     [Parameter(Mandatory = $true)][string]$ErrorFile
 )
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -73,7 +74,7 @@ try {
         }
     } else {
         $config = Get-LinkgateConfig $InstallDir
-        $output = & $kernel -install -config $config -install-start=true -install-open-panel=true "-install-autostart=$Autostart" "-install-tray=$WithTray" 2>&1
+        $output = & $kernel -install -config $config -install-start=true "-install-open-panel=$OpenPanel" "-install-autostart=$Autostart" "-install-tray=$WithTray" 2>&1
         if ($LASTEXITCODE -ne 0) { throw ($output -join "`n") }
     }
     exit 0

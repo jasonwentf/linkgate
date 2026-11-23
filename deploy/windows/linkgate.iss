@@ -74,10 +74,11 @@ Source: "check-update.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "setup-helper.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Linkgate 托盘"; Filename: "{app}\linkgate-tray.exe"; Parameters: "{code:TrayArguments}"; WorkingDir: "{app}"; Tasks: tray
+Name: "{group}\Linkgate 托盘"; Filename: "{app}\linkgate-tray.exe"; Parameters: "{code:TrayArguments}"; WorkingDir: "{app}"; Check: CreateTrayIcon
 Name: "{group}\卸载 Linkgate"; Filename: "{uninstallexe}"
 
 [Run]
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "{code:SilentLaunchParameters}"; Flags: runhidden waituntilterminated; Check: WizardSilent; AfterInstall: CheckSilentLaunchResult
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "{code:LaunchParameters}"; Description: "立即启动 Linkgate 并打开面板"; Flags: postinstall runhidden waituntilterminated skipifsilent; AfterInstall: CheckLaunchResult
 
 ; 卸载只由 usUninstall 事件执行：需要检查返回码，并支持 EXE 缺失时的 helper 回退。
@@ -88,10 +89,64 @@ var
   SnapshotDir: String;
   CommitAttempted: Boolean;
   InstallationCompleted: Boolean;
+  SilentLaunchFailed: Boolean;
+
+function TaskListSelection(Tasks, Task: String; Selected: Boolean): Boolean;
+var
+  Token: String;
+  Separator: Integer;
+begin
+  Tasks := Trim(Tasks);
+  if Length(Tasks) >= 2 then
+    if (Tasks[1] = '"') and (Tasks[Length(Tasks)] = '"') then
+      Tasks := Copy(Tasks, 2, Length(Tasks) - 2);
+  while Tasks <> '' do begin
+    Separator := Pos(',', Tasks);
+    if Separator = 0 then Separator := Length(Tasks) + 1;
+    Token := Lowercase(Trim(Copy(Tasks, 1, Separator - 1)));
+    Delete(Tasks, 1, Separator);
+    if (Token = Lowercase(Task)) or (Token = '*' + Lowercase(Task)) then Selected := True;
+    if Token = '!' + Lowercase(Task) then Selected := False;
+  end;
+  Result := Selected;
+end;
+
+function SilentTaskSelected(Task: String): Boolean;
+var
+  I: Integer;
+  Argument, Tasks, MergeTasks: String;
+  HasTasks: Boolean;
+begin
+  { 静默模式没有任务页，checkedonce 不能作为 WizardIsTaskSelected 的默认值来源。 }
+  HasTasks := False;
+  Tasks := '';
+  MergeTasks := '';
+  for I := 1 to ParamCount do begin
+    Argument := ParamStr(I);
+    if Pos('/TASKS=', Uppercase(Argument)) = 1 then begin
+      HasTasks := True;
+      Tasks := Copy(Argument, 8, Length(Argument));
+    end;
+    if Pos('/MERGETASKS=', Uppercase(Argument)) = 1 then
+      MergeTasks := Copy(Argument, 13, Length(Argument));
+  end;
+  Result := (Lowercase(Task) = 'autostart') or (Lowercase(Task) = 'tray');
+  if HasTasks then Result := TaskListSelection(Tasks, Task, False);
+  Result := TaskListSelection(MergeTasks, Task, Result);
+end;
 
 function SelectedBoolean(Task: String): String;
+var
+  Selected: Boolean;
 begin
-  if WizardIsTaskSelected(Task) then Result := 'true' else Result := 'false';
+  if WizardSilent then Selected := SilentTaskSelected(Task)
+  else Selected := WizardIsTaskSelected(Task);
+  if Selected then Result := 'true' else Result := 'false';
+end;
+
+function CreateTrayIcon: Boolean;
+begin
+  Result := SelectedBoolean('tray') = 'true';
 end;
 
 function HelperParameters(Phase, HelperPath: String): String;
@@ -160,7 +215,24 @@ end;
 function LaunchParameters(Param: String): String;
 begin
   ErrorFile := ExpandConstant('{tmp}\linkgate-launch-error.log');
-  Result := HelperParameters('Launch', ExpandConstant('{app}\setup-helper.ps1'));
+  Result := HelperParameters('Launch', ExpandConstant('{app}\setup-helper.ps1')) + ' -OpenPanel true';
+end;
+
+function SilentLaunchParameters(Param: String): String;
+begin
+  ErrorFile := ExpandConstant('{tmp}\linkgate-silent-launch-error.log');
+  Result := HelperParameters('Launch', ExpandConstant('{app}\setup-helper.ps1')) + ' -OpenPanel false';
+end;
+
+procedure CheckSilentLaunchResult;
+begin
+  SilentLaunchFailed := FileExists(ErrorFile);
+  if SilentLaunchFailed then Log('Linkgate 静默启动失败，错误日志：' + ErrorFile);
+end;
+
+function GetCustomSetupExitCode: Integer;
+begin
+  if SilentLaunchFailed then Result := 1 else Result := 0;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
