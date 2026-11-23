@@ -1,4 +1,4 @@
-# No automatic binary download. Run check-update.bat for a read-only version check,
+﻿# No automatic binary download. Run check-update.bat for a read-only version check,
 # or update.bat from an extracted release ZIP to replace this user's installation.
 # Windows task/process termination interrupts in-flight requests; finish them first.
 param(
@@ -7,6 +7,7 @@ param(
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
+. (Join-Path $PSScriptRoot 'transaction.ps1')
 
 try {
     $InstallDir = Get-LinkgateInstallDir
@@ -15,7 +16,7 @@ try {
     if (-not (Test-Path -LiteralPath $kernel)) { throw 'Linkgate is not installed. Double-click install.bat first.' }
     $current = Get-LinkgateVersion $kernel 'linkgate'
     Write-Host "Installed kernel: $current"
-    # Pre-0.2.2 trays had no -version flag; they can still be replaced together.
+    # 无需启动托盘读取版本；windowsgui 发行包使用 FileVersion 资源。
     $installedTray = $null
     try {
         $installedTray = Get-LinkgateVersion $tray 'linkgate-tray'
@@ -59,59 +60,45 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'The new kernel rejected your config. The running installation was not changed.' }
     $task = Get-LinkgateTask $InstallDir
     if ($null -eq $task -or $task.State -eq 'Disabled') { throw 'The Linkgate logon task is missing or disabled. Repair the installation first.' }
+    $autostart = (@($task.Triggers).Count -gt 0)
+    $withTray = $true
+    $statePath = Join-Path $InstallDir 'install-state.json'
+    if (Test-Path -LiteralPath $statePath) {
+        $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        if ($state.PSObject.Properties['Autostart']) { $autostart = [bool]$state.Autostart }
+        if ($state.PSObject.Properties['Tray']) { $withTray = [bool]$state.Tray }
+    }
     Write-Host "Update $current -> $incoming. Config and tokens will be kept."
     Write-Host 'This stops tray, then kernel, and interrupts any active requests.'
     $answer = Read-Host 'Finish active requests first. Type YES to update'
     if ($answer -cne 'YES') { Write-Host 'Cancelled; no changes made.'; return }
 
     $backup = Join-Path (Join-Path $InstallDir 'backups') ((Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $backup -Force | Out-Null
-    Copy-Item -LiteralPath $kernel -Destination (Join-Path $backup 'linkgate.exe')
-    $hadTray = Test-Path -LiteralPath $tray
-    if ($hadTray) { Copy-Item -LiteralPath $tray -Destination (Join-Path $backup 'linkgate-tray.exe') }
+    # 迁移前保存原 XML（包括 Interactive/S4U）、快捷方式、元数据、EXE 与运行状态。
+    $null = New-LinkgateSnapshot $InstallDir $backup $Config
     try {
-        # Disable respawn before stopping processes. Only exact installation paths
-        # are selected, never every process named linkgate on the machine.
-        Disable-ScheduledTask -TaskName 'Linkgate' -TaskPath '\' | Out-Null
-        foreach ($p in @(Get-LinkgateProcesses $InstallDir 'linkgate-tray')) {
-            Stop-LinkgateProcess $p
-        }
-        Stop-ScheduledTask -TaskName 'Linkgate' -TaskPath '\'
-        foreach ($p in @(Get-LinkgateProcesses $InstallDir 'linkgate')) {
-            Stop-LinkgateProcess $p
-        }
+        Stop-LinkgateInstallation $InstallDir
         Copy-Item -LiteralPath $kernelSource -Destination $kernel -Force
         Copy-Item -LiteralPath $traySource -Destination $tray -Force
         if ((Get-LinkgateVersion $kernel 'linkgate') -ne $incoming -or
             (Get-LinkgateVersion $tray 'linkgate-tray') -ne $incoming) { throw 'Installed binary version check failed.' }
-        Enable-ScheduledTask -TaskName 'Linkgate' -TaskPath '\' | Out-Null
-        Start-Linkgate $InstallDir $Config
+        # S4U 迁移属于更新事务；任何后续失败都恢复迁移前的完整状态。
+        & $kernel -install -config $Config -install-start=false "-install-autostart=$($autostart.ToString().ToLowerInvariant())" "-install-tray=$($withTray.ToString().ToLowerInvariant())"
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot register the new S4U background task.' }
+        Start-Linkgate $InstallDir $Config $withTray
     } catch {
         $failure = $_.Exception.Message
-        # Roll back both binaries as a pair; keep all backups, never delete data.
-        try {
-            Disable-ScheduledTask -TaskName 'Linkgate' -TaskPath '\' | Out-Null
-            foreach ($p in @(Get-LinkgateProcesses $InstallDir 'linkgate-tray')) { Stop-LinkgateProcess $p }
-            Stop-ScheduledTask -TaskName 'Linkgate' -TaskPath '\'
-            foreach ($p in @(Get-LinkgateProcesses $InstallDir 'linkgate')) { Stop-LinkgateProcess $p }
-            Copy-Item -LiteralPath (Join-Path $backup 'linkgate.exe') -Destination $kernel -Force
-            if ($hadTray) { Copy-Item -LiteralPath (Join-Path $backup 'linkgate-tray.exe') -Destination $tray -Force }
-            Enable-ScheduledTask -TaskName 'Linkgate' -TaskPath '\' | Out-Null
-            Start-Linkgate $InstallDir $Config
-            throw "Update failed: $failure. Previous binaries restored from $backup."
-        } catch {
-            # Even when copying/restarting fails, restore the logon task's enabled state.
-            Enable-ScheduledTask -TaskName 'Linkgate' -TaskPath '\' -ErrorAction SilentlyContinue | Out-Null
-            throw "Update/rollback result: $($_.Exception.Message). Backup: $backup"
-        }
+        try { Restore-LinkgateSnapshot $InstallDir $backup }
+        catch { throw "Update failed: $failure. Rollback failed: $($_.Exception.Message). Snapshot: $backup" }
+        throw "Update failed: $failure. Previous task XML, shortcut, metadata, binaries and running state restored. Snapshot: $backup"
     }
-    foreach ($script in @('common.ps1', 'update.ps1', 'update.bat', 'check-update.bat')) {
+    foreach ($script in @('common.ps1', 'transaction.ps1', 'update.ps1', 'update.bat', 'check-update.bat')) {
         try {
             Copy-Item -LiteralPath (Join-Path $PSScriptRoot $script) -Destination (Join-Path $InstallDir $script) -Force
         } catch { Write-Warning "Binaries updated, but could not refresh $script. Keep this release folder for future checks/updates." }
     }
     try {
-        @{ Config = $Config; Version = $incoming } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $InstallDir 'install-state.json') -Encoding UTF8
+        @{ Config = $Config; Version = $incoming; Autostart = $autostart; Tray = $withTray } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $InstallDir 'install-state.json') -Encoding UTF8
     } catch { Write-Warning 'Binaries updated, but install metadata could not be refreshed.' }
     Write-Host "Updated to $incoming. Previous binaries: $backup"
     Write-Host 'Click the tray logo and Open panel to verify your services/routes.'

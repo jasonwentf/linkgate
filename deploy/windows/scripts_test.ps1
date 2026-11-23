@@ -1,4 +1,4 @@
-# Parser and pure-helper tests only. Does not install, stop processes, access
+﻿# Parser and pure-helper tests only. Does not install, stop processes, access
 # GitHub, register tasks, or read ~/.linkgate. Run with PowerShell 5.1+ / pwsh.
 param()
 Set-StrictMode -Version Latest
@@ -47,4 +47,12 @@ function Get-ScheduledTask {
 $rejected = $false
 try { $null = Get-LinkgateTask $install } catch { $rejected = $true }
 if (-not $rejected) { throw 'Accepted a task targeting another installation.' }
-Write-Host 'PASS: PowerShell parser, semantic versions, config recovery and task isolation. Windows installation was not executed.'
+# 读取版本资源不会执行 EXE（尤其不能启动 windowsgui 托盘）。
+function Get-Item { return [PSCustomObject]@{ VersionInfo = [PSCustomObject]@{ FileVersion = '1.2.3-rc.1' } } }
+if ((Get-LinkgateVersion 'not-executed.exe' 'linkgate-tray') -ne '1.2.3-rc.1') { throw 'Tray FileVersion was not used.' }
+if ((Get-LinkgateVersion 'not-executed.exe' 'linkgate') -ne '1.2.3-rc.1') { throw 'Kernel FileVersion was not used.' }
+function Get-Item { return [PSCustomObject]@{ VersionInfo = [PSCustomObject]@{ FileVersion = '' } } }
+$rejected = $false
+try { $null = Get-LinkgateVersion 'never-run-tray.exe' 'linkgate-tray' } catch { $rejected = $true }
+if (-not $rejected) { throw 'Missing tray resource did not fail without executing it.' }
+Write-Host 'PASS: PowerShell parser, semantic versions, config recovery, task isolation and FileVersion. Windows installation was not executed.'

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -152,7 +153,8 @@ func TestCRUDGroupsAndUpstreamsListenerLifecycle(t *testing.T) {
 	}
 	for _, f := range []string{m.path, m.path + ".bak"} {
 		info, _ := os.Stat(f)
-		if info.Mode().Perm() != 0o600 {
+		// Windows 的权限由 ACL 决定，Go 的 POSIX 模式位不适用。
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 			t.Fatal("config not private")
 		}
 	}

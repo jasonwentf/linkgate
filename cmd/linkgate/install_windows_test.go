@@ -1,0 +1,67 @@
+//go:build windows
+
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"linkgate/internal/app"
+)
+
+func TestWindowsNativeCommandLine(t *testing.T) {
+	const config = `C:\用户 & space\config.yaml`
+	for _, command := range []string{`"C:\Linkgate\linkgate.exe" -config "` + config + `"`, `C:\Linkgate\linkgate.exe -config="` + config + `"`} {
+		args, err := parseWindowsCommandLine(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := configFromWindowsArgs(args, "default.yaml"); got != config {
+			t.Fatalf("%s: %s", command, got)
+		}
+	}
+	if _, err := parseWindowsCommandLine(""); err == nil {
+		t.Fatal("accepted unreadable command line")
+	}
+}
+
+func TestWindowsHealthyInstanceConfig(t *testing.T) {
+	const config = `C:\用户\custom config.yaml`
+	path := config
+	status := http.StatusOK
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Linkgate-Token") != "test-only-token" {
+			t.Error("missing local token")
+		}
+		w.WriteHeader(status)
+		fmt.Fprintf(w, `{"config_path":%q}`, path)
+	}))
+	defer server.Close()
+	cfg := app.Default()
+	cfg.Admin.Listen = strings.TrimPrefix(server.URL, "http://")
+	cfg.Admin.TokenFile = filepath.Join(t.TempDir(), "test.token")
+	if err := os.WriteFile(cfg.Admin.TokenFile, []byte("test-only-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !healthyWindowsKernel(cfg, config) {
+		t.Fatal("same-config healthy instance not reusable")
+	}
+	path = `C:\other.yaml`
+	if healthyWindowsKernel(cfg, config) {
+		t.Fatal("different runtime config accepted")
+	}
+	path = config
+	status = http.StatusUnauthorized
+	if healthyWindowsKernel(cfg, config) {
+		t.Fatal("unauthenticated/unhealthy instance accepted")
+	}
+	cfg.Admin.Disabled = true
+	if healthyWindowsKernel(cfg, config) {
+		t.Fatal("health cannot be inferred with admin disabled")
+	}
+}

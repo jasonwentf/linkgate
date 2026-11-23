@@ -10,7 +10,7 @@ log:
   level: info
   format: text
   ring_size: 2000
-  # file: ~/.linkgate/kernel.log   # 留空写 stdout；只有 file 日志由内核轮转
+  file: ~/.linkgate/kernel.log    # 内核轮转文件日志；留空才写 stdout
   max_size_bytes: 10485760       # 当前文件 10 MiB，加 3 份备份
   max_backups: 3
 
@@ -47,35 +47,39 @@ health:
   probe:
     type: http                    # http 或 tcp_connect（只探测建连，不是 TCP 转发）
 
+# 以下 URL 均为文档占位。示例线路默认停用，替换成真实地址后再 enabled: true。
 groups:
-  - name: axonhub
+  - name: demo
     listen: 127.0.0.1:8765
     protocol: http                # 默认 http；tcp 暂未支持
     # 优先级：数字越小越先走，允许 0；省略时按顺序给 10/20/...。
     upstreams:
-      # FRP 中转（阿里云）—— 打通后放最前
+      # 中转线路示例
       - name: relay
+        enabled: false
         kind: frp                 # 仅元数据，不参与选路
-        url: https://axonhub.example.com
+        url: http://192.0.2.1:8000 # TEST-NET-1 占位地址
         priority: 5
-        host: axonhub.example.com
 
       - name: tailscale
+        enabled: false
         kind: ts
-        url: http://203.0.113.10:8090
+        url: http://203.0.113.10:8090 # TEST-NET-3 占位地址
         priority: 10
 
       - name: zerotier
+        enabled: false
         kind: zt
-        url: http://198.51.100.20:8090
+        url: http://198.51.100.20:8090 # TEST-NET-2 占位地址
         priority: 20
 
       # Cloudflare Tunnel；开了 Access 才需要下面两个头
       - name: cloudflare
+        enabled: false
         kind: cf
-        url: https://axonhub-cf.example.com
+        url: https://backend.example.com # example.com 文档占位域名
         priority: 30
-        host: axonhub-cf.example.com
+        host: backend.example.com
         headers:
           CF-Access-Client-Id: "<ID>"
           CF-Access-Client-Secret: "<SECRET>"

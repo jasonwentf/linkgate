@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -14,10 +15,13 @@ import (
 )
 
 func TestVersionDefaultAndLdflagsInjection(t *testing.T) {
-	if app.Version != "0.2.2" || version != app.Version {
+	if app.Version != "0.3.0" || version != app.Version {
 		t.Fatalf("default main=%s app=%s", version, app.Version)
 	}
 	bin := filepath.Join(t.TempDir(), "linkgate")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	cmd := exec.Command("go", "build", "-ldflags", "-X main.version=9.8.7 -X linkgate/internal/app.Version=9.8.7", "-o", bin, ".")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build: %v %s", err, output)

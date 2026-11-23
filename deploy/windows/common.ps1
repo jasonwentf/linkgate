@@ -1,4 +1,4 @@
-# Shared by the Windows installer and updater. PowerShell 5.1+, current user only.
+﻿# Shared by the Windows installer and updater. PowerShell 5.1+, current user only.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -56,12 +56,18 @@ function Compare-LinkgateVersion([string]$Left, [string]$Right) {
 }
 
 function Get-LinkgateVersion([string]$Binary, [string]$Name) {
+    # windowsgui 托盘不再有可依赖的 stdout；发行的两个 EXE 都嵌入版本资源。
+    $value = [string](Get-Item -LiteralPath $Binary).VersionInfo.FileVersion
+    if ($value) {
+        $null = ConvertTo-LinkgateVersion $value
+        return $value
+    }
+    # 兼容升级前没有资源的旧内核。绝不执行旧托盘（它可能进入常驻消息循环）。
+    if ($Name -ne 'linkgate') { throw "Missing FileVersion resource in $Binary. Use one complete current release." }
     $output = & $Binary -version
     if ($LASTEXITCODE -ne 0) { throw "Cannot read version from $Binary" }
     $text = $output -join "`n"
-    if ($text -notmatch ('^' + [regex]::Escape($Name) + ' ([^\s]+)')) {
-        throw "Unexpected version output from $Binary. Install a matching kernel/tray release."
-    }
+    if ($text -notmatch '^linkgate ([^\s]+)') { throw "Unexpected version output from $Binary" }
     $value = $Matches[1]
     $null = ConvertTo-LinkgateVersion $value
     return $value
@@ -88,7 +94,11 @@ function Get-LinkgateConfig([string]$InstallDir) {
 }
 
 function Get-LinkgateTask([string]$InstallDir) {
-    $task = Get-ScheduledTask -TaskName 'Linkgate' -TaskPath '\' -ErrorAction SilentlyContinue
+    try { $task = Get-ScheduledTask -TaskName 'Linkgate' -TaskPath '\' -ErrorAction Stop }
+    catch {
+        if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { return $null }
+        throw
+    }
     if ($null -eq $task) { return $null }
     $expected = Join-Path $InstallDir 'linkgate.exe'
     $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -115,15 +125,15 @@ function Stop-LinkgateProcess([System.Diagnostics.Process]$Process) {
     if (-not $Process.WaitForExit(10000)) { throw "Process $($Process.Id) did not exit; refusing to replace binaries." }
 }
 
-function Start-Linkgate([string]$InstallDir, [string]$Config) {
+function Start-Linkgate([string]$InstallDir, [string]$Config, [bool]$WithTray = $true) {
     Start-ScheduledTask -TaskName 'Linkgate' -TaskPath '\'
     $tray = Join-Path $InstallDir 'linkgate-tray.exe'
-    if (@(Get-LinkgateProcesses $InstallDir 'linkgate-tray').Count -eq 0) {
+    if ($WithTray -and @(Get-LinkgateProcesses $InstallDir 'linkgate-tray').Count -eq 0) {
         Start-Process -FilePath $tray -ArgumentList "-config `"$Config`"" -WorkingDirectory $InstallDir
     }
     Start-Sleep -Seconds 2
     if (@(Get-LinkgateProcesses $InstallDir 'linkgate').Count -eq 0 -or
-        @(Get-LinkgateProcesses $InstallDir 'linkgate-tray').Count -eq 0) {
+        ($WithTray -and @(Get-LinkgateProcesses $InstallDir 'linkgate-tray').Count -eq 0)) {
         throw 'A process exited during startup. Check the Linkgate scheduled task and your config/ports.'
     }
 }

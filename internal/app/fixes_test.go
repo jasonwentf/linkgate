@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -246,8 +247,12 @@ func TestLogRotationBoundedAndEventResize(t *testing.T) {
 	}
 	for _, e := range entries {
 		info, _ := e.Info()
-		if info.Size() > 20 || info.Mode().Perm() != 0o600 {
-			t.Fatal("rotation bounds/permissions")
+		if info.Size() > 20 {
+			t.Fatal("rotation bounds")
+		}
+		// Windows 的 FileMode 不表示 ACL，不能用 POSIX 权限位验隐私。
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+			t.Fatal("rotation permissions")
 		}
 	}
 	l := NewEventLog(4)

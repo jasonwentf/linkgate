@@ -5,6 +5,7 @@ project_name: linkgate
 before:
   hooks:
     - go run ./tools/genicons
+    - go run ./tools/genversion -version {{ .Version }}
 
 builds:
   - id: kernel
@@ -29,6 +30,9 @@ builds:
     binary: linkgate-tray
     env:
       - CGO_ENABLED=1
+      - MACOSX_DEPLOYMENT_TARGET=13.0
+      - CGO_CFLAGS=-mmacosx-version-min=13.0
+      - CGO_LDFLAGS=-mmacosx-version-min=13.0
     goos:
       - darwin
       - windows
@@ -47,34 +51,63 @@ builds:
         goarch: amd64
         env:
           - CGO_ENABLED=0
+        ldflags:
+          - -s -w -H=windowsgui -X linkgate/internal/app.Version={{.Version}} -X main.version={{.Version}}
       - goos: darwin
         goarch: amd64
         env:
           - CGO_ENABLED=1
+          - MACOSX_DEPLOYMENT_TARGET=13.0
+          - CGO_CFLAGS=-mmacosx-version-min=13.0
+          - CGO_LDFLAGS=-mmacosx-version-min=13.0
           - CC=clang -arch x86_64
           - CXX=clang++ -arch x86_64
 
 archives:
-  - id: platform-pkg
+  - id: windows-pkg
     ids: [kernel, tray]
-    allow_different_binary_count: true # Linux / Windows arm64 are kernel-only.
+    allow_different_binary_count: true # Windows arm64 is kernel-only.
+    name_template: "linkgate_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [zip]
+    format_overrides:
+      - goos: linux
+        formats: [none]
+      - goos: darwin
+        formats: [none]
+    files:
+      - LICENSE
+      - README.md
+      - README.zh.md
+      - configs/linkgate.example.yaml
+      - src: deploy/windows/common.ps1
+        dst: .
+        strip_parent: true
+      - src: deploy/windows/transaction.ps1
+        dst: .
+        strip_parent: true
+      - src: deploy/windows/install.ps1
+        dst: .
+        strip_parent: true
+      - src: deploy/windows/update.ps1
+        dst: .
+        strip_parent: true
+      - src: deploy/windows/*.bat
+        dst: .
+        strip_parent: true
+  - id: unix-pkg
+    ids: [kernel, tray]
+    allow_different_binary_count: true # Linux is kernel-only.
     name_template: "linkgate_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     formats: [tar.gz]
     format_overrides:
       - goos: windows
-        formats: [zip]
+        formats: [none]
     files:
       - LICENSE
       - README.md
       - README.zh.md
       - configs/linkgate.example.yaml
       - deploy/linkgate.service
-      - src: deploy/windows/*.ps1
-        dst: .
-        strip_parent: true
-      - src: deploy/windows/*.bat
-        dst: .
-        strip_parent: true
 
 nfpms:
   - id: linkgate

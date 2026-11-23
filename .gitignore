@@ -4,6 +4,7 @@
 *.exe
 *.log
 *.test
+*.syso
 
 # 系统
 .DS_Store

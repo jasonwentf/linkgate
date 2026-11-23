@@ -1,0 +1,92 @@
+name: release-macos-dmg
+
+on:
+  workflow_run:
+    # This is the actual name in release.yml, not its filename.
+    workflows: [release]
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-dmg-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+      RELEASE_REF: ${{ github.event.workflow_run.head_branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the release created by the completed run
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=""
+          if [[ "$RELEASE_REF" == v* ]] &&
+             [[ "$(git rev-list -n 1 "$RELEASE_REF" 2>/dev/null || true)" == "$RELEASE_SHA" ]] &&
+             gh release view "$RELEASE_REF" >/dev/null 2>&1; then
+            tag="$RELEASE_REF"
+          else
+            # Do not use latest: another release may finish while this job is queued.
+            candidates=()
+            while IFS= read -r candidate; do
+              if gh release view "$candidate" >/dev/null 2>&1; then
+                candidates+=("$candidate")
+              fi
+            done < <(git tag --points-at "$RELEASE_SHA" --list 'v*')
+            if [ "${#candidates[@]}" -ne 1 ]; then
+              printf 'Cannot identify a unique release for %s (%s candidates).\n' "$RELEASE_SHA" "${#candidates[@]}" >&2
+              exit 1
+            fi
+            tag="${candidates[0]}"
+          fi
+          source deploy/macos/version.sh
+          linkgate_macos_version "${tag#v}"
+          version="$VERSION"
+          printf 'RELEASE_TAG=%s\nVERSION=%s\n' "$tag" "$version" >> "$GITHUB_ENV"
+          printf 'INPUT_DIR=%s\nOUTPUT_DIR=%s\n' \
+            "$RUNNER_TEMP/linkgate-macos-$GITHUB_RUN_ID/inputs" \
+            "$RUNNER_TEMP/linkgate-macos-$GITHUB_RUN_ID/output" >> "$GITHUB_ENV"
+
+      - name: Download both Darwin release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/linkgate-macos-$GITHUB_RUN_ID"
+          mkdir -p "$work"
+          chmod 700 "$work"
+          for arch in arm64 amd64; do
+            mkdir "$work/download-$arch"
+            mkdir -p "$INPUT_DIR/darwin_$arch"
+            asset="linkgate_${VERSION}_darwin_${arch}.tar.gz"
+            gh release download "$RELEASE_TAG" --pattern "$asset" --dir "$work/download-$arch"
+            tar -xzf "$work/download-$arch/$asset" -C "$INPUT_DIR/darwin_$arch" linkgate linkgate-tray
+          done
+
+      - name: Build universal app
+        run: bash deploy/macos/build-app.sh
+
+      - name: Build drag-and-drop disk image
+        run: bash deploy/macos/build-dmg.sh
+
+      - name: Upload DMG and its checksum to the same release
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="Linkgate-$VERSION.dmg"
+          (cd "$OUTPUT_DIR" && shasum -a 256 "$dmg" > "$dmg.sha256")
+          gh release upload "$RELEASE_TAG" "$OUTPUT_DIR/$dmg" "$OUTPUT_DIR/$dmg.sha256" --clobber

@@ -1,0 +1,126 @@
+name: release-windows
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  installer:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Resolve released tag
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LINKGATE_TRIGGER_REF: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          $tags = @(git tag --points-at HEAD --list 'v*')
+          if ($LASTEXITCODE -ne 0 -or $tags.Count -eq 0) { throw 'The release commit has no v* tag; refusing to guess.' }
+          $triggerTag = $env:LINKGATE_TRIGGER_REF -replace '^refs/tags/', ''
+          if ($triggerTag -cin $tags) {
+            $encoded = [Uri]::EscapeDataString($triggerTag)
+            $json = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$encoded"
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot verify the triggering release.' }
+            $release = $json | ConvertFrom-Json
+            if ($release.draft -or -not $release.published_at -or $release.tag_name -cne $triggerTag) { throw 'The triggering tag has no published release.' }
+            $tag = [string]$release.tag_name
+          } else {
+            $releaseTags = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases" --jq '.[] | select(.draft == false and .published_at != null) | .tag_name')
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot list all published releases; refusing a partial match.' }
+            $published = @($releaseTags | Where-Object { $_ -cin $tags })
+            if ($published.Count -ne 1) { throw 'Cannot uniquely match this release run to a published release; refusing to select a sorted tag.' }
+            $tag = [string]$published[0]
+          }
+          $version = $tag.Substring(1)
+          if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') { throw 'Invalid release tag.' }
+          'tagged=true' >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-go@v5
+        if: steps.release.outputs.tagged == 'true'
+        with:
+          go-version: '1.27.1'
+          check-latest: true
+
+      - name: Build Windows kernel and windowless tray
+        if: steps.release.outputs.tagged == 'true'
+        shell: pwsh
+        env:
+          LINKGATE_RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          CGO_ENABLED: '0'
+          GOARCH: amd64
+        run: |
+          go run ./tools/genicons
+          if ($LASTEXITCODE -ne 0) { throw 'Icon generation failed.' }
+          go run ./tools/genversion -version $env:LINKGATE_RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Version resource generation failed.' }
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { throw 'Go tests failed.' }
+          pwsh -NoProfile -File deploy/windows/scripts_test.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell parser/helper tests failed.' }
+          pwsh -NoProfile -File deploy/windows/transactions_test.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Installation/update transaction tests failed.' }
+          New-Item -ItemType Directory -Force bin/windows-setup | Out-Null
+          $flags = "-s -w -X linkgate/internal/app.Version=$env:LINKGATE_RELEASE_VERSION -X main.version=$env:LINKGATE_RELEASE_VERSION"
+          go build -trimpath -ldflags $flags -o bin/windows-setup/linkgate.exe ./cmd/linkgate
+          if ($LASTEXITCODE -ne 0) { throw 'Kernel build failed.' }
+          go build -trimpath -ldflags "$flags -H=windowsgui" -o bin/windows-setup/linkgate-tray.exe ./cmd/linkgate-tray
+          if ($LASTEXITCODE -ne 0) { throw 'Tray build failed.' }
+          foreach ($name in @('linkgate', 'linkgate-tray')) {
+            $info = (Get-Item "bin/windows-setup/$name.exe").VersionInfo
+            if ($info.FileVersion -ne $env:LINKGATE_RELEASE_VERSION -or $info.ProductVersion -ne $env:LINKGATE_RELEASE_VERSION) { throw "$name has incorrect Windows version resources." }
+          }
+          $env:LINKGATE_WINDOWS_BINARY_DIR = (Resolve-Path bin/windows-setup).Path
+          go test ./tools/genversion -run TestWindowsExecutables -count=1
+          if ($LASTEXITCODE -ne 0) { throw 'Windows PE/resource verification failed.' }
+
+      - name: Compile Inno Setup wizard
+        if: steps.release.outputs.tagged == 'true'
+        shell: pwsh
+        env:
+          LINKGATE_RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          choco install innosetup --no-progress --yes
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed.' }
+          $compilers = @(Get-ChildItem -LiteralPath ${env:ProgramFiles(x86)} -Directory -Filter 'Inno Setup*' | ForEach-Object { Join-Path $_.FullName 'ISCC.exe' } | Where-Object { Test-Path -LiteralPath $_ })
+          if ($compilers.Count -eq 0) { throw 'Cannot find the installed Inno Setup compiler.' }
+          $iscc = $compilers[-1]
+          $binaryDir = (Resolve-Path bin/windows-setup).Path
+          & $iscc "/DMyAppVersion=$env:LINKGATE_RELEASE_VERSION" "/DBinaryDir=$binaryDir" deploy/windows/linkgate.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation failed.' }
+          $setup = "dist/windows-setup/Linkgate-Setup-$env:LINKGATE_RELEASE_VERSION-win64.exe"
+          $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $([IO.Path]::GetFileName($setup))" | Set-Content -LiteralPath "$setup.sha256" -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        if: steps.release.outputs.tagged == 'true'
+        with:
+          name: windows-installer-${{ steps.release.outputs.version }}
+          path: dist/windows-setup/*
+          if-no-files-found: error
+
+      - name: Attach installer to existing GitHub Release
+        if: steps.release.outputs.tagged == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LINKGATE_RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          LINKGATE_RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          gh release view $env:LINKGATE_RELEASE_TAG
+          if ($LASTEXITCODE -ne 0) { throw 'The primary release workflow did not publish this tag.' }
+          $setup = "dist/windows-setup/Linkgate-Setup-$env:LINKGATE_RELEASE_VERSION-win64.exe"
+          gh release upload $env:LINKGATE_RELEASE_TAG $setup "$setup.sha256" --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed.' }

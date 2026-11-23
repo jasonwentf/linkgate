@@ -33,7 +33,21 @@ func run() error {
 	doctor := flag.Bool("doctor", false, "逐条探测线路并打印结果，然后退出")
 	initConfig := flag.Bool("init", false, "在配置文件路径写入一份示例配置")
 	showVersion := flag.Bool("version", false, "打印版本后退出")
+	install := flag.Bool("install", false, "安装当前用户的后台内核与托盘启动项")
+	uninstall := flag.Bool("uninstall", false, "卸载当前安装的启动项（保留配置与日志）")
+	flag.BoolVar(&windowsInstall.autostart, "install-autostart", true, "安装时启用登录自启动")
+	flag.BoolVar(&windowsInstall.tray, "install-tray", true, "安装时创建托盘启动项")
+	flag.BoolVar(&windowsInstall.start, "install-start", true, "安装后立即启动内核与托盘")
+	flag.BoolVar(&windowsInstall.dryrun, "dryrun", false, "只打印 Windows 安装计划，不修改系统")
+	flag.BoolVar(&windowsInstall.openPanel, "install-open-panel", false, "安装启动后打开面板")
 	flag.Parse()
+
+	if *install && *uninstall {
+		return fmt.Errorf("-install 与 -uninstall 不能同时使用")
+	}
+	if *install || *uninstall {
+		return runInstall(*configPath, *uninstall)
+	}
 
 	if *showVersion {
 		fmt.Printf("linkgate %s (%s)\n", version, commit)
@@ -183,7 +197,8 @@ func printBanner(cfg *app.Config, configPath string) {
 }
 
 func writeExample(path string) error {
-	example := `# Linkgate 配置示例。真实地址请按你自己的线路改写。
+	example := `# Linkgate 初始配置：先从面板添加你自己的服务与线路。
+# 下方注释中的 TEST-NET 地址仅为文档占位，不会被探测或转发。
 version: 1
 
 admin:
@@ -192,6 +207,7 @@ admin:
 log:
   level: info
   format: text
+  file: ~/.linkgate/kernel.log
 
 # 请求体常达数 MB：小于 8MiB 放内存，超过落临时文件
 buffer:
@@ -220,21 +236,15 @@ health:
   recover_threshold: 2
   probe_path: /health
 
-groups:
-  - name: axonhub
-    listen: 127.0.0.1:8765
-    upstreams:
-      - name: relay
-        url: https://axonhub.example.com
-        priority: 10
-        host: axonhub.example.com
-        headers: {}
-      - name: tailscale
-        url: http://203.0.113.10:8090
-        priority: 20
-      - name: zerotier
-        url: http://198.51.100.20:8090
-        priority: 30
+groups: []
+# 添加服务示例（取消注释并替换 URL 后再使用）：
+# groups:
+#   - name: demo
+#     listen: 127.0.0.1:8765
+#     upstreams:
+#       - name: backend
+#         url: http://192.0.2.1:8000  # TEST-NET-1 占位地址，不是真实上游
+#         priority: 10
 `
 	path = app.ExpandPath(path)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

@@ -130,10 +130,11 @@ func (c *client) reload() error {
 // ---------- 本机配置定位（只读，不校验整份配置） ----------
 
 type localSettings struct {
-	configPath string
-	adminAddr  string
-	token      string
-	tokenErr   error
+	configPath    string
+	adminOverride string
+	adminAddr     string
+	token         string
+	tokenErr      error
 }
 
 func expand(p string) string {
@@ -158,7 +159,7 @@ func defaultConfigPath() string {
 }
 
 func loadSettings(configPath, adminOverride string) localSettings {
-	s := localSettings{configPath: configPath, adminAddr: "127.0.0.1:8766"}
+	s := localSettings{configPath: configPath, adminOverride: adminOverride, adminAddr: "127.0.0.1:8766"}
 
 	// 只取 admin 与 data_dir 两项；配置有别的错误时托盘仍能工作。
 	var partial struct {
@@ -362,9 +363,14 @@ func openConfigFile(path string) error {
 
 // ---------- 托盘 ----------
 
+// Standalone trays remain read-only; the macOS app registers its bootstrap hook.
+var bootstrapKernel = func(t *tray) (bool, error) { return false, nil }
+
 type tray struct {
 	settings localSettings
 	cli      *client
+
+	bootstrapAfter time.Time
 
 	mu        sync.Mutex
 	connected bool
@@ -493,7 +499,7 @@ func (t *tray) loop() {
 func (t *tray) refresh() {
 	if t.settings.tokenErr != nil && t.cli.token == "" {
 		// 令牌可能在内核首次启动后才生成，每轮重读一次
-		fresh := loadSettings(t.settings.configPath, "")
+		fresh := loadSettings(t.settings.configPath, t.settings.adminOverride)
 		if fresh.token != "" {
 			t.cli.token = fresh.token
 			t.settings.tokenErr = nil
@@ -501,6 +507,13 @@ func (t *tray) refresh() {
 	}
 
 	st, err := t.cli.status()
+	if err != nil {
+		if started, bootstrapErr := bootstrapKernel(t); bootstrapErr != nil {
+			err = bootstrapErr
+		} else if started {
+			st, err = t.cli.status()
+		}
+	}
 	if err != nil {
 		t.mu.Lock()
 		t.connected = false

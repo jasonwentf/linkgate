@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -115,10 +116,13 @@ func TestWindowsIconRejectsInvalidPNG(t *testing.T) {
 }
 
 func TestTrayVersionDefaultAndLdflags(t *testing.T) {
-	if version != "0.2.2" || version != app.Version {
+	if version != "0.3.0" || version != app.Version {
 		t.Fatalf("tray=%s app=%s", version, app.Version)
 	}
 	bin := filepath.Join(t.TempDir(), "linkgate-tray")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	cmd := exec.Command("go", "build", "-ldflags", "-X main.version=9.8.7", "-o", bin, ".")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build: %v %s", err, output)
