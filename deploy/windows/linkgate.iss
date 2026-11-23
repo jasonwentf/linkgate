@@ -153,7 +153,7 @@ function TrayArguments(Param: String): String;
 var
   ConfigPath: String;
 begin
-  ConfigPath := GetIniString('Install', 'Config', ExpandConstant('{userprofile}\.linkgate\config.yaml'), SnapshotDir + '\config.ini');
+  ConfigPath := GetIniString('Install', 'Config', ExpandConstant('{userpf}\.linkgate\config.yaml'), SnapshotDir + '\config.ini');
   Result := '-config "' + ConfigPath + '"';
 end;
 
