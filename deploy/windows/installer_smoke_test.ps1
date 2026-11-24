@@ -1,4 +1,6 @@
 ﻿# 真实安装器 E2E：仅允许临时 GitHub Windows runner，不能在用户机器上顺手执行。
+# windows-latest runner 是管理员账号：仍严格要求 S4U，不能证明标准用户的任务权限。
+# helper 实际调用 Windows PowerShell 5.1；标准用户的 S4U/cmdlet/Interactive 回退需另外真机验证。
 param([Parameter(Mandatory = $true)][string]$Installer)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

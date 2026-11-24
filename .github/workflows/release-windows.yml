@@ -72,6 +72,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'PowerShell parser/helper tests failed.' }
           pwsh -NoProfile -File deploy/windows/transactions_test.ps1
           if ($LASTEXITCODE -ne 0) { throw 'Installation/update transaction tests failed.' }
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File deploy/windows/diagnostics_test.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 stderr/persistent diagnostic tests failed.' }
           New-Item -ItemType Directory -Force bin/windows-setup | Out-Null
           $flags = "-s -w -X linkgate/internal/app.Version=$env:LINKGATE_RELEASE_VERSION -X main.version=$env:LINKGATE_RELEASE_VERSION"
           go build -trimpath -ldflags $flags -o bin/windows-setup/linkgate.exe ./cmd/linkgate

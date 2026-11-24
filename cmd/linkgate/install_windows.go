@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 	"unsafe"
 
 	"linkgate/internal/app"
@@ -30,8 +31,37 @@ func windowsCommand(name string, args ...string) *exec.Cmd {
 	return cmd
 }
 
+func decodeWindowsOutput(out []byte) string {
+	if utf8.Valid(out) {
+		return string(out)
+	}
+	kernel := syscall.NewLazyDLL("kernel32.dll")
+	codepage, _, _ := kernel.NewProc("GetConsoleOutputCP").Call()
+	if codepage == 0 || codepage == 65001 {
+		codepage, _, _ = kernel.NewProc("GetOEMCP").Call()
+	}
+	return decodeWindowsCodepage(out, codepage)
+}
+
+func decodeWindowsCodepage(out []byte, codepage uintptr) string {
+	if len(out) == 0 {
+		return ""
+	}
+	convert := syscall.NewLazyDLL("kernel32.dll").NewProc("MultiByteToWideChar")
+	count, _, _ := convert.Call(codepage, 0, uintptr(unsafe.Pointer(&out[0])), uintptr(len(out)), 0, 0)
+	if count == 0 {
+		return string(out)
+	}
+	text := make([]uint16, count)
+	written, _, _ := convert.Call(codepage, 0, uintptr(unsafe.Pointer(&out[0])), uintptr(len(out)), uintptr(unsafe.Pointer(&text[0])), count)
+	if written == 0 {
+		return string(out)
+	}
+	return syscall.UTF16ToString(text)
+}
+
 func windowsPowerShell(script string, values map[string]string) ([]byte, error) {
-	u := utf16.Encode([]rune("$ErrorActionPreference = 'Stop'; " + script))
+	u := utf16.Encode([]rune("$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); " + script))
 	b := make([]byte, len(u)*2)
 	for i, c := range u {
 		binary.LittleEndian.PutUint16(b[i*2:], c)
@@ -43,7 +73,7 @@ func windowsPowerShell(script string, values map[string]string) ([]byte, error) 
 	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("Windows 操作失败: %w\n%s", err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("Windows 操作失败: %w\n%s", err, decodeWindowsOutput(out))
 	}
 	return out, nil
 }
@@ -145,6 +175,71 @@ func parseWindowsCommandLine(commandLine string) ([]string, error) {
 	return args, nil
 }
 
+func registerWindowsTask(xmlPath string, values map[string]string, autostart bool) (windowsRegistrationResult, error) {
+	values["AUTOSTART"] = strconv.FormatBool(autostart)
+	return registerWindowsTaskWithFallback(func(method windowsRegistrationMethod) error {
+		if method == windowsRegisterXML {
+			out, err := windowsCommand("schtasks.exe", "/Create", "/TN", "Linkgate", "/XML", xmlPath, "/F").CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("%w\n%s", err, decodeWindowsOutput(out))
+			}
+			return nil
+		}
+		values["LOGON_TYPE"] = "S4U"
+		if method == windowsRegisterInteractive {
+			values["LOGON_TYPE"] = "Interactive"
+		}
+		_, err := windowsPowerShell(`
+try {
+    $existing = $null
+    try { $existing = Get-ScheduledTask -TaskName 'Linkgate' -TaskPath '\' -ErrorAction Stop } catch {
+        if ($_.CategoryInfo.Category -ne 'ObjectNotFound') { throw }
+    }
+    if ($null -ne $existing) {
+        $owner = $existing.Principal.UserId
+        if ($owner -ne $env:LINKGATE_INSTALL_SID) { $owner = (New-Object Security.Principal.NTAccount($owner)).Translate([Security.Principal.SecurityIdentifier]).Value }
+        if ($owner -ne $env:LINKGATE_INSTALL_SID -or @($existing.Actions).Count -ne 1 -or $existing.Actions[0].Execute -ne $env:LINKGATE_INSTALL_EXE) { throw '任务属于其他用户或目录，拒绝覆盖。' }
+    }
+    $action = New-ScheduledTaskAction -Execute $env:LINKGATE_INSTALL_EXE -Argument ('-config "' + $env:LINKGATE_INSTALL_CONFIG + '"') -WorkingDirectory $env:LINKGATE_INSTALL_DIR
+    $principal = New-ScheduledTaskPrincipal -UserId $env:LINKGATE_INSTALL_SID -LogonType $env:LINKGATE_INSTALL_LOGON_TYPE -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 255 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    $parameters = @{ TaskName = 'Linkgate'; TaskPath = '\'; Action = $action; Principal = $principal; Settings = $settings; Force = $true }
+    if ($env:LINKGATE_INSTALL_AUTOSTART -eq 'true') { $parameters.Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:LINKGATE_INSTALL_SID }
+    Register-ScheduledTask @parameters | Out-Null
+    $registered = Get-ScheduledTask -TaskName 'Linkgate' -TaskPath '\' -ErrorAction Stop
+    if ([string]$registered.Principal.LogonType -ne $env:LINKGATE_INSTALL_LOGON_TYPE) { throw '注册后的任务登录类型不符合预期。' }
+} catch {
+    [Console]::Error.WriteLine($_.Exception.ToString())
+    exit 1
+}
+`, values)
+		return err
+	})
+}
+
+func retainWindowsRegistrationDiagnostic(result windowsRegistrationResult) string {
+	text := result.Diagnostics
+	if windowsInteractiveTask(result.LogonType) {
+		text += "\n" + windowsInteractiveWarning
+	}
+	if text == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(home, ".linkgate", "install-errors")
+	if os.MkdirAll(dir, 0700) != nil {
+		return ""
+	}
+	path := filepath.Join(dir, "registration-"+time.Now().UTC().Format("20060102-150405.000000000")+".log")
+	if os.WriteFile(path, []byte(text), 0600) != nil {
+		return ""
+	}
+	return path
+}
+
 func runInstall(configPath string, uninstall bool) error {
 	executable, err := os.Executable()
 	if err != nil {
@@ -175,7 +270,7 @@ func runInstall(configPath string, uninstall bool) error {
 	if err := verifyWindowsTask(state.Task, state.SID, executable); err != nil {
 		return err
 	}
-	values := map[string]string{"EXE": executable, "DIR": directory, "CONFIG": configPath, "TRAY": filepath.Join(directory, "linkgate-tray.exe")}
+	values := map[string]string{"EXE": executable, "DIR": directory, "CONFIG": configPath, "TRAY": filepath.Join(directory, "linkgate-tray.exe"), "SID": state.SID}
 	if uninstall {
 		return uninstallWindows(state, values)
 	}
@@ -201,14 +296,14 @@ func runInstall(configPath string, uninstall bool) error {
 	}
 	out, err := windowsCommand(executable, "-check", "-config", configPath).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("配置校验失败，请修正配置后重试: %w\n%s", err, out)
+		return fmt.Errorf("配置校验失败，请修正配置后重试: %w\n%s", err, decodeWindowsOutput(out))
 	}
 	cfg, err := app.Load(configPath)
 	if err != nil {
 		return err
 	}
 	if running {
-		if state.Task != nil && (state.Task.LogonType != "S4U" || !state.Task.Enabled || state.Task.Autostart != windowsInstall.autostart || !sameWindowsPath(state.Task.Arguments, `-config "`+configPath+`"`)) {
+		if state.Task != nil && (!supportedWindowsTask(state.Task.LogonType) || !state.Task.Enabled || state.Task.Autostart != windowsInstall.autostart || !sameWindowsPath(state.Task.Arguments, `-config "`+configPath+`"`)) {
 			return fmt.Errorf("当前后台任务设置不同，请先停止内核再迁移任务或修改自启设置；未修改运行中的实例")
 		}
 		if !healthyWindowsKernel(cfg, configPath) {
@@ -238,12 +333,29 @@ func runInstall(configPath string, uninstall bool) error {
 	if closeErr != nil {
 		return closeErr
 	}
+	registration := windowsRegistrationResult{LogonType: "S4U"}
+	if running && state.Task != nil {
+		registration.LogonType = state.Task.LogonType
+	}
 	if !running || state.Task == nil {
-		out, err = windowsCommand("schtasks.exe", "/Create", "/TN", "Linkgate", "/XML", xmlFile.Name(), "/F").CombinedOutput()
+		registration, err = registerWindowsTask(xmlFile.Name(), values, windowsInstall.autostart)
 		if err != nil {
-			return fmt.Errorf("注册静默后台任务失败（公司策略可能禁止 S4U 任务），没有请求管理员权限: %w\n%s", err, out)
+			return err
 		}
 	}
+	if registration.Diagnostics != "" {
+		fmt.Printf("首选任务注册失败，已回退使用 %s。原始诊断：\n%s\n", registration.Method, registration.Diagnostics)
+	}
+	if windowsInteractiveTask(registration.LogonType) {
+		fmt.Println(windowsInteractiveWarning)
+	}
+	diagnosticPath := retainWindowsRegistrationDiagnostic(registration)
+	if diagnosticPath != "" {
+		fmt.Println("任务注册诊断已保留：", diagnosticPath)
+	}
+	values["LOGON_TYPE"] = registration.LogonType
+	values["REGISTRATION_METHOD"] = string(registration.Method)
+	values["REGISTRATION_DIAGNOSTIC"] = diagnosticPath
 	values["CREATE_TRAY"] = strconv.FormatBool(windowsInstall.tray)
 	values["WITH_TRAY"] = strconv.FormatBool(windowsInstall.tray)
 	values["AUTOSTART"] = strconv.FormatBool(windowsInstall.autostart)
@@ -263,7 +375,7 @@ if ($env:LINKGATE_INSTALL_CREATE_TRAY -eq 'true' -and $env:LINKGATE_INSTALL_AUTO
     if ($sc.TargetPath -ne $env:LINKGATE_INSTALL_TRAY) { throw '托盘启动项属于其他安装，拒绝覆盖。' }
     Remove-Item -LiteralPath $shortcut
 }
-@{ Config = $env:LINKGATE_INSTALL_CONFIG; Autostart = ($env:LINKGATE_INSTALL_AUTOSTART -eq 'true'); Tray = ($env:LINKGATE_INSTALL_WITH_TRAY -eq 'true') } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:LINKGATE_INSTALL_DIR 'install-state.json') -Encoding UTF8
+@{ Config = $env:LINKGATE_INSTALL_CONFIG; Autostart = ($env:LINKGATE_INSTALL_AUTOSTART -eq 'true'); Tray = ($env:LINKGATE_INSTALL_WITH_TRAY -eq 'true'); LogonType = $env:LINKGATE_INSTALL_LOGON_TYPE; RegistrationMethod = $env:LINKGATE_INSTALL_REGISTRATION_METHOD; RegistrationDiagnostic = $env:LINKGATE_INSTALL_REGISTRATION_DIAGNOSTIC } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:LINKGATE_INSTALL_DIR 'install-state.json') -Encoding UTF8
 `, values)
 	if err != nil {
 		return fmt.Errorf("内核任务已注册，但托盘启动项未完成；可重新安装或运行 -uninstall: %w", err)
@@ -272,7 +384,7 @@ if ($env:LINKGATE_INSTALL_CREATE_TRAY -eq 'true' -and $env:LINKGATE_INSTALL_AUTO
 		if !running {
 			out, err := windowsCommand("schtasks.exe", "/Run", "/TN", "Linkgate").CombinedOutput()
 			if err != nil {
-				return fmt.Errorf("启动内核任务失败: %w\n%s", err, out)
+				return fmt.Errorf("启动内核任务失败: %w\n%s", err, decodeWindowsOutput(out))
 			}
 			if err := waitWindowsKernel(cfg, executable); err != nil {
 				return err
@@ -297,7 +409,11 @@ if (@(Get-Process -Name 'linkgate-tray' -ErrorAction SilentlyContinue | Where-Ob
 			}
 		}
 	}
-	fmt.Println("Linkgate 安装完成。配置与日志保留在用户的 .linkgate 目录；内核以 S4U 后台任务运行，无黑色窗口。")
+	if windowsInteractiveTask(registration.LogonType) {
+		fmt.Println("Linkgate 安装完成，使用可见窗口兼容模式；配置与日志保留在用户的 .linkgate 目录。")
+	} else {
+		fmt.Println("Linkgate 安装完成。配置与日志保留在用户的 .linkgate 目录；内核以 S4U 后台任务运行，无黑色窗口。")
+	}
 	return nil
 }
 
@@ -307,7 +423,7 @@ func uninstallWindows(state windowsState, values map[string]string) error {
 		for _, args := range [][]string{{"/End", "/TN", "Linkgate"}, {"/Delete", "/TN", "Linkgate", "/F"}} {
 			out, err := windowsCommand("schtasks.exe", args...).CombinedOutput()
 			if err != nil {
-				return fmt.Errorf("停用或注销 Linkgate 任务失败: %w\n%s", err, out)
+				return fmt.Errorf("停用或注销 Linkgate 任务失败: %w\n%s", err, decodeWindowsOutput(out))
 			}
 		}
 	}

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,20 @@ import (
 
 	"linkgate/internal/app"
 )
+
+func TestWindowsDiagnosticOutputEncoding(t *testing.T) {
+	const text = "错误：拒绝访问\r\n详细中文信息"
+	if decodeWindowsOutput([]byte(text)) != text {
+		t.Fatal("UTF-8 output changed")
+	}
+	gbk, err := hex.DecodeString("b4edcef3a3babedcbef8b7c3ceca0d0acfeacfb8d6d0cec4d0c5cfa2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeWindowsCodepage(gbk, 936); got != text {
+		t.Fatalf("CP936 output garbled: %q", got)
+	}
+}
 
 func TestWindowsNativeCommandLine(t *testing.T) {
 	const config = `C:\用户 & space\config.yaml`
