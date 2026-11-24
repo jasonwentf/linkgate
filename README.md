@@ -4,7 +4,7 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Go](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)
 ![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)
-![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows11&logoColor=white)
+![Windows](https://custom-icon-badges.demolab.com/badge/Windows-0078D6?logo=windows11&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)
 
 Linkgate is a transparent HTTP reverse proxy that runs locally. It gives every client tool on your machine one fixed local address, and silently fails over between multiple upstream routes in the background.
@@ -103,7 +103,7 @@ For command-line installs, prebuilt `.tar.gz` archives are still included in eac
 
 ### Windows
 
-![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows11&logoColor=white)
+![Windows](https://custom-icon-badges.demolab.com/badge/Windows-0078D6?logo=windows11&logoColor=white)
 
 For Windows 10/11 x64, use the graphical setup wizard. No Go toolchain or administrator account is needed.
 

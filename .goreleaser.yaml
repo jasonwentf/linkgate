@@ -142,6 +142,12 @@ nfpms:
 checksum:
   name_template: "checksums.txt"
 
+release:
+  # 置顶两个最常用下载：Windows 向导安装器 + macOS 拖拽 dmg。勿删。
+  header: |
+    **Most-used downloads** — [Linkgate-Setup-{{ .Version }}-win64.exe](https://github.com/jasonwentf/linkgate/releases/download/v{{ .Version }}/Linkgate-Setup-{{ .Version }}-win64.exe)（Windows 向导安装器）· [Linkgate-{{ .Version }}.dmg](https://github.com/jasonwentf/linkgate/releases/download/v{{ .Version }}/Linkgate-{{ .Version }}.dmg)（macOS 拖拽安装）
+  name_template: "v{{ .Version }}"
+
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
 

@@ -4,7 +4,7 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Go](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)
 ![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)
-![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows11&logoColor=white)
+![Windows](https://custom-icon-badges.demolab.com/badge/Windows-0078D6?logo=windows11&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)
 
 Linkgate 是一个运行在本地的透明 HTTP 反向代理，用来为本机的各类客户端工具提供固定的本地接入地址，并在后台的多条网络线路之间自动切换。
@@ -212,7 +212,7 @@ groups:
 
 ### Windows
 
-![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows11&logoColor=white)
+![Windows](https://custom-icon-badges.demolab.com/badge/Windows-0078D6?logo=windows11&logoColor=white)
 
 Windows 10 与 Windows 11（64 位）推荐使用向导安装器，不需要安装 Go 环境，也不需要管理员权限。
 
